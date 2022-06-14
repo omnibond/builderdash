@@ -1,6 +1,8 @@
 # builderdash
 Builderdash is a cross cloud build system for images
 
+WARNING: Most of the README is now out of date.
+
 Dependencies:  
 	-python 2.7  
 	-botocore  
