@@ -1,0 +1,15 @@
+- build:
+  - (custom)mkdir:
+    - /custom
+# can I put sshkeyuser in here or else add a command for this
+  - (custom)commands:
+    - sudo chown builderdash:builderdash /custom
+
+  - (custom,lammps)builderdash:
+    - lammps.yaml
+
+  - (custom)commands:
+    - rm /opt/CloudyCluster/var/dbName.json || true
+  - (save)saveimage: 
+      'true': ''
+  - (delete)deleteinstance: true

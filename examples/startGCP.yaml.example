@@ -1,0 +1,32 @@
+- start:
+  - local: false
+  - sshkeyname: builderdash
+  - sshkeyuser: builderdash
+# ssh-keygen -m pem -f builderdash.pem -C builderdash
+  - sshkey: /home/USER/builderdash.pem
+  - pubkeypath: /home/USER/builderdash.pem.pub
+  - spot: no
+  - cloudservice: gcp
+  - instancetype: n1-standard-32
+  - region: us-east1-b
+  - ostype: centos
+  - imagefamily: none
+  - imagefamilyproject: none
+  - instancename: custom
+
+  - inhibitstartup: yes
+  - sourceimage: projects/public-marketplace-cc/global/images/cloudycluster-v3-2-0-release
+  - buildtype: custom
+
+  - subnet: ''
+  - bucketname: cloudyclusterfirebasedev.appspot.com
+  - projectname: cloudyclusterfirebasedev
+  - projectid: cloudyclusterfirebasedev
+  - customtags:
+    - save
+    - delete
+    - lammps
+
+- build:
+  - builderdash:
+    - build.yaml

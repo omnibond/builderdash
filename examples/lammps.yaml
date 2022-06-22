@@ -1,0 +1,8 @@
+- lammps:
+  - filetransfer:
+      lammps:
+        - lammps.sh
+        - /tmp
+        - true
+  - commands:
+    - sh /tmp/lammps.sh
