@@ -13,6 +13,7 @@
   - imagefamily: none
   - imagefamilyproject: none
   - instancename: custom
+  - addhash: false
 
   - inhibitstartup: yes
   - sourceimage: projects/public-marketplace-cc/global/images/cloudycluster-v3-2-0-release

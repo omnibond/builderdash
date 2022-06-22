@@ -143,12 +143,15 @@ def get_instance_name(myBuild, sourcename):
 
     image_time = time.strftime("%Y%m%d", time.gmtime())
 
-    try:
-        image_hash = subprocess.check_output(["git", "describe", "--always", "--dirty=plus"]).strip().decode()
-        image_hash = image_hash.replace(".", "-")
-    except FileNotFoundError:
-        image_hash = None
-    except subprocess.CalledProcessError:
+    if hasattr(myBuild, "addhash") and myBuild.addhash:
+        try:
+            image_hash = subprocess.check_output(["git", "describe", "--always", "--dirty=plus"]).strip().decode()
+            image_hash = image_hash.replace(".", "-")
+        except FileNotFoundError:
+            image_hash = None
+        except subprocess.CalledProcessError:
+            image_hash = None
+    else:
         image_hash = None
 
     image_random = os.urandom(2).hex()

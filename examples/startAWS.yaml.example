@@ -8,6 +8,7 @@
   - region: us-east-2
   - ostype: centos
   - instancename: custom
+  - addhash: false
 
   - inhibitstartup: yes
   - sourceimage: ami-0f37568dd398c474d
