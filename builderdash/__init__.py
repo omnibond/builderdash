@@ -179,6 +179,11 @@ def awsInstance(myBuild):
             pass
     myBuild = handleUserData(myBuild)
 
+    if hasattr(myBuild, "disksize"):
+        disksize = int(myBuild.disksize)
+    else:
+        disksize = 55
+
     if hasattr(myBuild, "awsspot"):
         if hasattr(myBuild, "awsspotprice"):
             logging.info("awsspotprice is %s", str(myBuild.awsspotprice))
@@ -196,7 +201,7 @@ def awsInstance(myBuild):
                 currentSpot = response['SpotPriceHistory'][x]['SpotPrice']
             myBuild.awsspotprice = currentSpot * 1.2
             logging.info("awsspotprice is %s", str(myBuild.awsspotprice))
-        blockDeviceStuff = [{'DeviceName': '/dev/sda1', "Ebs": {"DeleteOnTermination": True, "VolumeSize": 55, "VolumeType": "gp2"}}]
+        blockDeviceStuff = [{'DeviceName': '/dev/sda1', "Ebs": {"DeleteOnTermination": True, "VolumeSize": disksize, "VolumeType": "gp2"}}]
         launchSpecs = {"BlockDeviceMappings": blockDeviceStuff, "ImageId": str(myBuild.sourceimage), "KeyName": str(myBuild.sshkeyname), "InstanceType": str(myBuild.instancetype)}
         response = client.request_spot_instances(AvailabilityZoneGroup = 'eu-west-1a', DryRun=False, LaunchSpecification=launchSpecs, SpotPrice=str(myBuild.awsspotprice), Type=str(myBuild.spottype), ValidFrom=myBuild.spotfrom, ValidUntil=myBuild.spotuntil)
         logging.info("Spot Instance spinning up")
@@ -218,7 +223,7 @@ def awsInstance(myBuild):
         get_instance_name(myBuild, sourcename)
         logging.info("Spinning up the instance")
         iamstuff = {'Name': 'instance-admin'}
-        blockDeviceStuff = [{'DeviceName': '/dev/sda1', "Ebs": {"DeleteOnTermination": True, "VolumeSize": 55, "VolumeType": "gp2"}}]
+        blockDeviceStuff = [{'DeviceName': '/dev/sda1', "Ebs": {"DeleteOnTermination": True, "VolumeSize": disksize, "VolumeType": "gp2"}}]
         if hasattr(myBuild, "subnet"):
             if hasattr(myBuild, "securitygroup"):
                 response = client.run_instances(BlockDeviceMappings = blockDeviceStuff, DryRun=False, ImageId = str(myBuild.sourceimage), MinCount = 1, MaxCount = 1, SecurityGroupIds=[myBuild.securitygroup], SubnetId = str(myBuild.subnet), KeyName = str(myBuild.sshkeyname), InstanceType = myBuild.instancetype, IamInstanceProfile = iamstuff, UserData = str(myBuild.userdata), TagSpecifications = [{'ResourceType':'instance','Tags':[{'Key':'Name', 'Value': str(myBuild.instancename)}]}])
@@ -308,6 +313,11 @@ def googleInstance(myBuild):
 
     get_instance_name(myBuild, myBuild.sourceimage)
 
+    if hasattr(myBuild, "disksize"):
+        disksize = myBuild.disksize
+    else:
+        disksize = "55"
+
     with open(str(myBuild.pubkeypath), 'rb') as f:
         tempsshkey = str(myBuild.sshkeyuser)+':'+f.read().decode()
     body = {
@@ -319,7 +329,7 @@ def googleInstance(myBuild):
                 'autoDelete': autoDelete,
                 'initializeParams': {
                     'sourceImage': myBuild.sourceimage,
-                    'diskSizeGb': '55'
+                    'diskSizeGb': disksize
                 }
             }
         ],
