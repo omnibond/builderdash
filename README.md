@@ -16,7 +16,7 @@ AWS Credentials:
 	https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html  
 
 Basic Instructions:  
-	To run builder dash use the command 'python3 \_\_init\_\_.py -c <cfgFileName>'  
+	To run builderdash first install with python3 setup.py install then use the builderdash command which will be installed (ensure PATH is set up if not installing as root).
   
 List of arguments:  
 	-V, --version  
