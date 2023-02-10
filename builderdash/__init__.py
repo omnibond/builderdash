@@ -999,7 +999,7 @@ def runBuild(root, myBuild, connectionObj, scriptName):
             config = json.load(f.read())
     elif scriptName.endswith(".yaml"):
         with open(scriptName) as f:
-            config = yaml.load(f.read())
+            config = yaml.safe_load(f.read())
     else:
         config = parseConfig(scriptName)
     if len(config) < 1:
