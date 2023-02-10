@@ -1,8 +1,8 @@
 # builderdash
 
 Builderdash is a cross cloud build system for images developed by
-Omnibond Systems.  It was originally developed for use with
-CloudyCluster although it may now be used on its own.
+Omnibond.  It was originally developed for use with CloudyCluster
+although it may now be used on its own.
 
 See https://www.omnibond.com/ and https://www.cloudycluster.com/ for
 more information.
@@ -10,7 +10,7 @@ more information.
 ## Example
 
 A basic example of its use to modify a CloudyCluster image to include
-the LAMMPS simulation package is given in the examples directory.
+the LAMMPS simulation package is given in the `examples` directory.
 
 Take `startCLOUD.yaml.example` where `CLOUD` is `AWS` or `GCP`, copy to
 `startCLOUD.yaml`, and modify as appropriate for your configuration.
