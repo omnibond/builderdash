@@ -12,8 +12,8 @@ more information.
 A basic example of its use to modify a CloudyCluster image to include
 the LAMMPS simulation package is given in the examples directory.
 
-Take startCLOUD.yaml.example where cloud is AWS or GCP, copy to
-startCLOUD.yaml, and modify as appropriate for your configuration.
+Take `startCLOUD.yaml.example` where `CLOUD` is `AWS` or `GCP`, copy to
+`startCLOUD.yaml`, and modify as appropriate for your configuration.
 
 Notably ensure it is specified to use the most recent version of
 CloudyCluster as a base and that credentials are available (see the
@@ -28,7 +28,8 @@ https://docs.gcp.cloudycluster.com/software/add-sw-custom-image/.
 ## Basic Instructions
 
 Install builderdash with `python3 setup.py install` which will install
-the builderdash command.  Ensure PATH is set correctly if not installing
+the `builderdash` command.  Ensure `PATH` is set correctly if not
+installing
 as root.
 
 List of arguments:  
