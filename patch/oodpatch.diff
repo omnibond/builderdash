@@ -1,0 +1,211 @@
+--- CC-master/src/srv/WebDavSetup.py	2023-02-13 12:51:31.890841413 -0500
++++ CloudyCluster/src/srv/WebDavSetup.py	2023-02-09 23:54:56.925976183 -0500
+@@ -660,7 +660,7 @@
+ 
+             os.mkdir("/etc/ood/config/clusters.d")
+             os.mkdir("/etc/ood/config/apps/bc_desktop")
+-
++            cloudvar = ClusterMethods.cloudProvider
+             for scheduler in cluster["schedulers"]:
+                 image = ClusterMethods.getInstanceMetadata({"requestedAttr": "ami-id"})["payload"]
+ 
+@@ -672,7 +672,7 @@
+     host: localhost
+   job:
+     adapter: ccq
+-    cloud: 'gcp'
++    cloud: '%s'
+     scheduler: "%s"
+     image: "%s"
+   batch_connect:
+@@ -682,7 +682,7 @@
+       websockify_cmd: '/usr/bin/websockify'
+     basic:
+       header: "#!/bin/bash"
+-""" % (scheduler["schedName"], scheduler["schedName"], image))
++""" % (scheduler["schedName"], cloudvar, scheduler["schedName"], image))
+                 f.close()
+ 
+                 metadataObj = {"requestedAttr": "region"}
+@@ -708,9 +708,36 @@
+                 default_instance_type = None
+                 if ClusterMethods.cloudProvider == "gcp":
+                     default_instance_type = "n1-standard-1"
++                    placeholder = "projects/<project_name>/global/images/<image_name>"
++                    customflag = "-gcpgi"
++                    gpu_form = """
++  - gpu_type
++  - num_gpus"""
++                    gpu_options = """
++  gpu_type:
++    label: "GPU type (optional)"
++    widget: select
++    value: None
++    options: [None, 'nvidia-tesla-t4', 'nvidia-tesla-v100', 'nvidia-tesla-p100', 'nvidia-tesla-p4', 'nvidia-tesla-k80']
++  num_gpus:
++    label: "Number of GPUs (optional)"
++    widget: select
++    options: [1, 2, 4, 8]
++    help: |
++      This field will be ignored if you select "None" for GPU type"""
++                    gpu_logic = """
++<% if gpu_type != "None" %>
++    - "-gcpgpu"
++    - "-gcpgpusp"
++    - "<%= num_gpus %>:<%= gpu_type %>"
++<% end %>"""
+                 elif ClusterMethods.cloudProvider == "aws":
+-                    default_instance_type = "t3-small"
+-
++                    default_instance_type = "t3.small"
++                    placeholder = "ami-xxxxxxxx"
++                    customflag = "-awsami"
++                    gpu_form = ""
++                    gpu_options = ""
++                    gpu_logic = ""
+                 f = open("/etc/ood/config/apps/bc_desktop/%s.yml" % scheduler["schedName"], "w")
+                 f.write("""title: "Cloudy Desktop (%s) "
+ cluster: "%s"
+@@ -721,8 +748,7 @@
+   - instance_type
+   - num_instances
+   - custom_image_id
+-  - gpu_type
+-  - num_gpus
++%s
+ attributes:
+   hours:
+     value: 1
+@@ -737,43 +763,29 @@
+     widget: "number_field"
+   custom_image_id:
+     label: "Custom Image Name (optional)"
+-    placeholder: projects/<project_name>/global/images/<image_name>
++    placeholder: %s
+     help: |
+       Enter the full path to a custom image you have created following the procedure in the CloudyCluster documentation.
+-  gpu_type:
+-    label: "GPU type (optional)"
+-    widget: select
+-    value: None
+-    options: [None, 'nvidia-tesla-t4', 'nvidia-tesla-v100', 'nvidia-tesla-p100', 'nvidia-tesla-p4', 'nvidia-tesla-k80']
+-  num_gpus:
+-    label: "Number of GPUs (optional)"
+-    widget: select
+-    options: [1, 2, 4, 8]
+-    help: |
+-      This field will be ignored if you select "None" for GPU type
++%s
+   desktop: "xfce"
+-""" % (scheduler["schedName"], scheduler["schedName"], default_instance_type, compute_instance_list))
++""" % (scheduler["schedName"], scheduler["schedName"], gpu_form, default_instance_type, compute_instance_list, placeholder, gpu_options))
+                 f.close()
+ 
+             f = open("/etc/ood/config/apps/bc_desktop/submit.yml.erb", "w")
+             f.write("""script:
+   native:
+     - "-tl"
+-    - "<%= "00:%02d:00" % hours %>"
+-    - "-gcpit"
+-    - "<%= instance_type %>"
++    - "<%%= "00:%%02d:00" %% hours %%>"
++    - "-%sit"
++    - "<%%= instance_type %%>"
+     - "-ni"
+-    - "<%= num_instances  %>"
+-<% if gpu_type != "None" %>
+-    - "-gcpgpu"
+-    - "-gcpgpusp"
+-    - "<%= num_gpus %>:<%= gpu_type %>"
+-<% end %>
+-<% if custom_image_id != "" %>
+-    - "-gcpgi"
+-    - "<%= custom_image_id %>"
+-<% end %>
+-""")
++    - "<%%= num_instances  %%>"
++%s
++<%% if custom_image_id != "" %%>
++    - "%s"
++    - "<%%= custom_image_id %%>"
++<%% end %%>
++""" % (cloudvar, gpu_logic, customflag))
+             f.close()
+ 
+             cloudylib.system("mkdir -p /etc/ood/config/apps/shell")
+@@ -793,7 +805,7 @@
+ """)
+             f.close()
+ 
+-            cloudylib.system("cd /var/www/ood/apps/sys; git clone https://github.com/johrstrom/cc_jupyter jupyter")
++            cloudylib.system("cd /var/www/ood/apps/sys; git clone https://github.com/omnibond/ood-jupyter.git jupyter")
+             f = open("/var/www/ood/apps/sys/jupyter/form.yml", "w")
+             f.write("""title: "Jupyter (%s) "
+ cluster: "%s"
+@@ -804,8 +816,7 @@
+   - instance_type
+   - num_instances
+   - custom_image_id
+-  - gpu_type
+-  - num_gpus
++%s
+ attributes:
+   hours:
+     value: 1
+@@ -820,43 +831,29 @@
+     widget: "number_field"
+   custom_image_id:
+     label: "Custom Image Name (optional)"
+-    placeholder: projects/<project_name>/global/images/<image_name>
++    placeholder: %s
+     help: |
+       Enter the full path to a custom image you have created following the procedure in the CloudyCluster documentation.
+-  gpu_type:
+-    label: "GPU type (optional)"
+-    widget: select
+-    value: None
+-    options: [None, 'nvidia-tesla-t4', 'nvidia-tesla-v100', 'nvidia-tesla-p100', 'nvidia-tesla-p4', 'nvidia-tesla-k80']
+-  num_gpus:
+-    label: "Number of GPUs (optional)"
+-    widget: select
+-    options: [1, 2, 4, 8]
+-    help: |
+-      This field will be ignored if you select "None" for GPU type
++%s
+   desktop: "xfce"
+-""" % (scheduler["schedName"], scheduler["schedName"], default_instance_type, compute_instance_list))
++""" % (scheduler["schedName"], scheduler["schedName"], gpu_form, default_instance_type, compute_instance_list, placeholder, gpu_options))
+             f.close()
+ 
+             f = open("/var/www/ood/apps/sys/jupyter/submit.yml.erb", "w")
+             f.write("""script:
+   native:
+     - "-tl"
+-    - "<%= "00:%02d:00" % hours %>"
+-    - "-gcpit"
+-    - "<%= instance_type %>"
++    - "<%%= "00:%%02d:00" %% hours %%>"
++    - "-%sit"
++    - "<%%= instance_type %%>"
+     - "-ni"
+-    - "<%= num_instances  %>"
+-<% if gpu_type != "None" %>
+-    - "-gcpgpu"
+-    - "-gcpgpusp"
+-    - "<%= num_gpus %>:<%= gpu_type %>"
+-<% end %>
+-<% if custom_image_id != "" %>
+-    - "-gcpgi"
+-    - "<%= custom_image_id %>"
+-<% end %>
+-""")
++    - "<%%= num_instances  %%>"
++%s
++<%% if custom_image_id != "" %%>
++    - "%s"
++    - "<%%= custom_image_id %%>"
++<%% end %%>
++""" % (cloudvar, gpu_logic, customflag))
+             f.close()
+ 
+             cloudylib.system("sed -i 's|^Listen 80$|# Listen 80|g' /opt/rh/httpd24/root/etc/httpd/conf/httpd.conf")

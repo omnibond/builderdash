@@ -1,0 +1,8 @@
+- build:
+  - (custom,patch)builderdash:
+    - patch.yaml
+  - (custom)commands:
+    - rm /opt/CloudyCluster/var/dbName.json || true
+  - (save)saveimage: 
+      'true': ''
+  - (delete)deleteinstance: true

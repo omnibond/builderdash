@@ -1,0 +1,8 @@
+- patch:
+  - filetransfer:
+      patch:
+        - oodpatch.diff
+        - /tmp
+        - true
+  - commands:
+    - sudo patch /opt/CloudyCluster/srv/WebDavSetup.py < /tmp/oodpatch.diff 

@@ -1,0 +1,26 @@
+- start:
+  - local: false
+  - sshkeyname: KEYNAME
+  - sshkeyuser: centos
+  - sshkey: /path/to/KEYNAME.pem
+  - cloudservice: aws
+  - instancetype: c5.9xlarge
+  - region: us-east-2
+  - ostype: centos
+  - instancename: custom
+  - addhash: true
+
+  - inhibitstartup: yes
+  - sourceimage: ami-065ccfc7bcad48598
+  - buildtype: custom
+
+  - subnet: ''
+  - securitygroup: sg-204abc49
+  - customtags:
+    - patch
+    - save
+    - delete
+
+- build:
+  - builderdash:
+    - build.yaml
