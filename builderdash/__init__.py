@@ -294,7 +294,8 @@ def googleInstance(myBuild):
     machine_type = "zones/%s/machineTypes/%s" % (zone, str(myBuild.instancetype))
 
     # use image family if applicable
-    if str(myBuild.buildtype) == 'base' and hasattr(myBuild, "imagefamily") and str(myBuild.imagefamily) != 'none':
+    if (myBuild.buildtype == "base" or myBuild.buildtype == "kernel") and \
+        hasattr(myBuild, "imagefamily") and myBuild.imagefamily != "none":
         try:
             # Name of the image family to search for.
             family = myBuild.imagefamily
