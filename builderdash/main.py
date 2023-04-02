@@ -179,6 +179,10 @@ def awsInstance(myBuild):
             pass
     myBuild = handleUserData(myBuild)
 
+    if not hasattr(myBuild, "rootdev"):
+        r = client.describe_images(ImageIds=[myBuild.sourceimage])
+        myBuild.rootdev = r["Images"][0]["RootDeviceName"]
+
     if hasattr(myBuild, "disksize"):
         disksize = int(myBuild.disksize)
     else:
@@ -201,7 +205,7 @@ def awsInstance(myBuild):
                 currentSpot = response['SpotPriceHistory'][x]['SpotPrice']
             myBuild.awsspotprice = currentSpot * 1.2
             logging.info("awsspotprice is %s", str(myBuild.awsspotprice))
-        blockDeviceStuff = [{'DeviceName': '/dev/sda1', "Ebs": {"DeleteOnTermination": True, "VolumeSize": disksize, "VolumeType": "gp2"}}]
+        blockDeviceStuff = [{'DeviceName': myBuild.rootdev, "Ebs": {"DeleteOnTermination": True, "VolumeSize": disksize, "VolumeType": "gp2"}}]
         launchSpecs = {"BlockDeviceMappings": blockDeviceStuff, "ImageId": str(myBuild.sourceimage), "KeyName": str(myBuild.sshkeyname), "InstanceType": str(myBuild.instancetype)}
         response = client.request_spot_instances(AvailabilityZoneGroup = 'eu-west-1a', DryRun=False, LaunchSpecification=launchSpecs, SpotPrice=str(myBuild.awsspotprice), Type=str(myBuild.spottype), ValidFrom=myBuild.spotfrom, ValidUntil=myBuild.spotuntil)
         logging.info("Spot Instance spinning up")
@@ -223,7 +227,7 @@ def awsInstance(myBuild):
         get_instance_name(myBuild, sourcename)
         logging.info("Spinning up the instance")
         iamstuff = {'Name': 'instance-admin'}
-        blockDeviceStuff = [{'DeviceName': '/dev/sda1', "Ebs": {"DeleteOnTermination": True, "VolumeSize": disksize, "VolumeType": "gp2"}}]
+        blockDeviceStuff = [{'DeviceName': myBuild.rootdev, "Ebs": {"DeleteOnTermination": True, "VolumeSize": disksize, "VolumeType": "gp2"}}]
         if hasattr(myBuild, "subnet"):
             if hasattr(myBuild, "securitygroup"):
                 response = client.run_instances(BlockDeviceMappings = blockDeviceStuff, DryRun=False, ImageId = str(myBuild.sourceimage), MinCount = 1, MaxCount = 1, SecurityGroupIds=[myBuild.securitygroup], SubnetId = str(myBuild.subnet), KeyName = str(myBuild.sshkeyname), InstanceType = myBuild.instancetype, IamInstanceProfile = iamstuff, UserData = str(myBuild.userdata), TagSpecifications = [{'ResourceType':'instance','Tags':[{'Key':'Name', 'Value': str(myBuild.instancename)}]}])
@@ -676,7 +680,7 @@ def saveImage(slist, myBuild):
             tags.append({"Key": "sourcename", "Value": response["Images"][0]["Name"]})
         except:
             logging.error("could not describe source image")
-        response = client.create_image(Description='Builderdash', Name=str(imageName), InstanceId = str(myBuild.instanceId), BlockDeviceMappings=[{'DeviceName': '/dev/sda1','Ebs': {'VolumeType': 'gp2'}}], TagSpecifications=[{"ResourceType": "image", "Tags": tags}])
+        response = client.create_image(Description='Builderdash', Name=str(imageName), InstanceId = str(myBuild.instanceId), BlockDeviceMappings=[{'DeviceName': myBuild.rootdev,'Ebs': {'VolumeType': 'gp2'}}], TagSpecifications=[{"ResourceType": "image", "Tags": tags}])
         logging.info(str(response))
         savedImage = response['ImageId']
         counter = 0
