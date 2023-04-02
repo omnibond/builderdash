@@ -13,6 +13,6 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     python_requires='>=3.6',
     entry_points={
-        "console_scripts": ["builderdash = builderdash:main"]
+        "console_scripts": ["builderdash = builderdash.main:main"]
     }
 )
