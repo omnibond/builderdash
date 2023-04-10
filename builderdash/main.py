@@ -67,6 +67,8 @@ def setCloudyClusterEnvVars(connectionObj, myBuild):
         CC_OS_NAME = 'centos'
     elif myBuild.ostype == 'rhel':
         CC_OS_NAME = 'rhel'
+    elif myBuild.ostype == 'almalinux':
+        CC_OS_NAME = 'almalinux'
     CC_AWS_SSH_USERNAME = myBuild.sshkeyuser
     commandString = 'sudo sed -i \'$ aexport CC_BUILD_TYPE='+CC_BUILD_TYPE+'\' /etc/profile'
     runCommand(connectionObj, commandString, myBuild)
