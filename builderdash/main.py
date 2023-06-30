@@ -69,6 +69,8 @@ def setCloudyClusterEnvVars(connectionObj, myBuild):
         CC_OS_NAME = 'rhel'
     elif myBuild.ostype == 'almalinux':
         CC_OS_NAME = 'almalinux'
+    elif myBuild.ostype == 'ubuntu':
+        CC_OS_NAME = 'ubuntu'
     CC_AWS_SSH_USERNAME = myBuild.sshkeyuser
     commandString = 'sudo sed -i \'$ aexport CC_BUILD_TYPE='+CC_BUILD_TYPE+'\' /etc/profile'
     runCommand(connectionObj, commandString, myBuild)
@@ -857,15 +859,21 @@ def makeDirectory(mklist, connectionObj, myBuild):
 
 def fileTransfer(ftlist, connectionObj, myBuild):
     user = "%s@%s:" % (myBuild.sshkeyuser, myBuild.remoteIp)
+    logging.info("This is ftlist: %s", ftlist)
     for key in ftlist:
         sourcepath = ftlist[key][0]
         destination = ftlist[key][1]
         upload = ftlist[key][2]
+        logging.info("This is sourcepath: %s \n This is user: %s \n This is destination: %s \n" % (sourcepath, user, destination))
         logging.info("upload is %s; type %s", upload, type(upload))
+        logging.info("Yo mama")
         if upload:
+            logging.info("It this one!")
             commandString = "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i %s %s %s" % (myBuild.sshkey, sourcepath, user + destination)
         else:
+            logging.info("No this one!")
             commandString = "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i %s %s %s" % (myBuild.sshkey, user + sourcepath, destination)
+        logging.info("gay")
         logging.info("commandString is %s", commandString)
         logging.info("before runCommand FT")
         runCommand(connectionObj, commandString, myBuild, local=True)
