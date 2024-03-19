@@ -11,23 +11,18 @@ import platform
 import subprocess
 import ast
 import paramiko
-import io
 import logging
-import requests
 import botocore
 import botocore.session
 import googleapiclient.discovery
-import time, datetime
+import time
+import datetime
 import select
-import json    
 import re
-import resource
-import pdb
-import traceback
 import json
 import yaml
-import pty
 import random
+from textwrap import dedent
 
 class Build():
     def setup(self, configSection):
@@ -54,7 +49,7 @@ class Build():
         logging.info("List of Tags is %s" % self.tagList)
 
 #########Set Environment Variables that CC Needs#########
-def setCloudyClusterEnvVars(connectionObj, myBuild):
+def setCloudyClusterEnvVars(ssh, myBuild):
     if myBuild.buildtype == 'userapps' or myBuild.buildtype == 'base':
         CC_BUILD_TYPE = 'UserApps'
     elif myBuild.buildtype == 'dev':
@@ -73,18 +68,18 @@ def setCloudyClusterEnvVars(connectionObj, myBuild):
         CC_OS_NAME = 'ubuntu'
     CC_AWS_SSH_USERNAME = myBuild.sshkeyuser
     commandString = 'sudo sed -i \'$ aexport CC_BUILD_TYPE='+CC_BUILD_TYPE+'\' /etc/profile'
-    runCommand(connectionObj, commandString, myBuild)
+    runCommand(ssh, commandString, myBuild)
     commandString = 'sudo sed -i \'$ aexport CC_OS_NAME='+CC_OS_NAME+'\' /etc/profile'
-    runCommand(connectionObj, commandString, myBuild)
+    runCommand(ssh, commandString, myBuild)
     commandString = 'sudo sed -i \'$ aexport CC_AWS_SSH_USERNAME='+CC_AWS_SSH_USERNAME+'\' /etc/profile'
-    runCommand(connectionObj, commandString, myBuild)
+    runCommand(ssh, commandString, myBuild)
     commandString = 'sudo sed -i \'$ aexport CLOUD='+str(myBuild.cloudservice)+'\' /etc/profile'
-    runCommand(connectionObj, commandString, myBuild)
+    runCommand(ssh, commandString, myBuild)
     commandString = 'source /etc/profile'
-    runCommand(connectionObj, commandString, myBuild)
+    runCommand(ssh, commandString, myBuild)
     logging.info("end of cloudy vars")
 
-def processInitSection(configSection, connectionObj, myBuild):
+def processInitSection(configSection, myBuild):
     logging.info("Entered processInitSection")
     myBuild.setup(configSection)
 
@@ -107,20 +102,30 @@ def processInitSection(configSection, connectionObj, myBuild):
         # *******   loop / sleep until userapps
         if hasattr(myBuild, 'instancetype'):
             logging.info("instance type is %s", str(myBuild.instancetype))
-        sshKey = myBuild.sshkey
-        connectionObj = sshControl('connect', myBuild, connectionObj)
-        osType = myBuild.ostype
+        # Give instance time to boot, for ssh service to come up, and for cloudinit to run, etc.
+        time.sleep(20)
+        ssh = ssh_connect(myBuild)
         logging.info('osType inside process init is %s', str(myBuild.ostype))
-        stdin, stdout, stderr = connectionObj.exec_command('sudo yum install wget -y', get_pty=True)
-        stdout.channel.recv_exit_status()
-        #setCloudyClusterEnvVars(connectionObj, myBuild)
-        return connectionObj
+
+        # TODO why are we installing wget here? Can this be cleaned up?
+        run_cmd = 'sudo yum install wget -y'
+        logging.info('calling exec_command on: %s', run_cmd)
+        stdin, stdout, stderr = ssh.get_target_session().exec_command(run_cmd, get_pty=True)
+        run_ret = stdout.channel.recv_exit_status()
+        logging.info('exec_command returned: %d', run_ret)
+        #logging.info('exec_command stdout: %s', stdout)
+        #logging.info('exec_command stderr: %s', stderr)
+        #setCloudyClusterEnvVars(ssh, myBuild)
+
+        return ssh
 
 def launchInstance(myBuild):
     if myBuild.cloudservice == 'aws':
         result = awsInstance(myBuild)
     elif myBuild.cloudservice == 'gcp':
         result = googleInstance(myBuild)
+    elif myBuild.cloudservice == 'kubevirt':
+        result = kubevirt_instance(myBuild)
     else:
         logging.info("No cloudservice was found in the cfg file. Please put one under the init section in your cfg file")
         sys.exit(1)
@@ -205,6 +210,7 @@ def awsInstance(myBuild):
             logging.info("use current spot price + 20%")
             response = client.describe_spot_price_history(AvailabilityZone = str(myBuild.az), InstanceTypes=['t3.small'], ProductDescriptions=['Linux/UNIX'], StartTime = datetime.datetime.now(), EndTime = datetime.datetime.now())
             for thing in range(len(response['SpotPriceHistory'])):
+                # FIXME: Mary, the variable x below is used before assignment.
                 logging.info(response['SpotPriceHistory'][x]['SpotPrice'])
                 currentSpot = response['SpotPriceHistory'][x]['SpotPrice']
             myBuild.awsspotprice = currentSpot * 1.2
@@ -358,14 +364,23 @@ def googleInstance(myBuild):
         }
     }
     if hasattr(myBuild, "inhibitstartup") and myBuild.inhibitstartup:
-        body["metadata"]["items"].append({"key": "startup-script", "value": "echo '{\"lookupTableName\": \"delete\"}' > /opt/CloudyCluster/var/dbName.json"})
+        body["metadata"]["items"].append(
+            {
+                "key": "startup-script",
+                "value": "echo '{\"lookupTableName\": \"delete\"}' > /opt/CloudyCluster/var/dbName.json"
+            }
+        )
     myBuild.tempsshkey = tempsshkey
     myBuild.machine_type = machine_type
     x = compute.instances().insert(project=myBuild.projectname, zone=zone, body=body).execute()
     place = None
     counter = 0
-    while place != True and counter < 60:
-        result = compute.instances().list(project=myBuild.projectname, zone=zone, filter='(status eq RUNNING) (name eq ' + str(myBuild.instancename) + ')').execute()
+    while not place and counter < 60:
+        result = compute.instances().list(
+            project=myBuild.projectname,
+            zone=zone,
+            filter='(status eq RUNNING) (name eq ' + str(myBuild.instancename) + ')'
+        ).execute()
         logging.info("myBuild.instancename is: " + str(myBuild.instancename))
         logging.info("result is: " + str(result))
         if "items" in result:
@@ -394,64 +409,202 @@ def googleInstance(myBuild):
     myBuild.instanceId = None
     return(myBuild)
 
-def dispatchOption(option, args, connectionObj, myBuild):
+def kubevirt_instance(myBuild):
+    # log source image
+    print("Source image is " + str(myBuild.sourceimage))
+    get_instance_name(myBuild, myBuild.sourceimage)
+    if hasattr(myBuild, "disksize"):
+        disksize = myBuild.disksize
+    else:
+        disksize = "55"
+    kv_inst_tmpl = dedent('''\
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: {name}
+          namespace: {namespace}
+          labels: {labels}
+        spec:
+          running: {instance_state}
+          instancetype:
+            kind: {instance_type_kind}
+            name: {instance_type_name}
+          template:
+            metadata:
+              labels: {labels}
+            spec:
+              domain:
+                devices:
+                  interfaces:
+                  - name: default
+                    masquerade: {{}}
+                    macAddress: {mac_address}
+                  disks:
+                  - name: {data_volume_disk_name}
+                    disk:
+                      bus: virtio
+                  - name: cloudinitdisk
+                    disk:
+                      bus: virtio
+              networks:
+              - name: default
+                pod: {{}}
+              volumes:
+              - name: cloudinitdisk
+                cloudInitNoCloud:
+                  userData: |
+                    #cloud-config
+                    users:
+                      - name: {ssh_user}
+                        groups: sudo
+                        shell: /bin/bash
+                        sudo: ALL=(ALL) NOPASSWD:ALL
+                        lock_passwd: false
+                        plain_text_passwd: {plain_text_passwd}
+                        ssh_authorized_keys:
+                          - {public_key_openssh}
+              - name: {data_volume_disk_name}
+                dataVolume:
+                  name: {data_volume_name}
+          dataVolumeTemplates:
+          - metadata:
+              name: {data_volume_name}
+            spec:
+              pvc:
+                accessModes:
+                - {data_volume_pvc_access_mode}
+                resources:
+                  requests:
+                    storage: {data_volume_pvc_storage_capacity}
+              source:
+                http:
+                  url: {data_volume_source_http_url}''')
+
+    with open(str(myBuild.pubkeypath), 'r') as f:
+        kubevirt_public_key_openssh = f.read()
+
+    d = {'name': myBuild.instancename,
+         'namespace': 'default',
+         'labels': {},
+         'instance_state': 'true',
+         'instance_type_kind': 'VirtualMachineInstancetype',
+         'instance_type_name': myBuild.instancetype,
+         'mac_address': 'ee:ee:ee:ee:ee:ee',
+         'data_volume_disk_name': 'data-volume-disk',
+         'ssh_user': str(myBuild.sshkeyuser),
+         'public_key_openssh': kubevirt_public_key_openssh,
+         'data_volume_name': 'data-volume-' + myBuild.instancename,
+         'data_volume_pvc_access_mode': 'ReadWriteOnce',
+         'data_volume_pvc_storage_capacity': disksize,
+         'data_volume_source_http_url': myBuild.sourceimage,
+         'plain_text_passwd': myBuild.plain_text_passwd
+        }
+    rendered = kv_inst_tmpl.format(**d)
+    with open('/tmp/builderdash-kubevirt-instance-manifest.yaml', 'w') as wf:
+        wf.write(rendered)
+    logging.info('myBuild.cloudservice is: %s', myBuild.cloudservice)
+    logging.info('myBuild.instancename is: %s', myBuild.instancename)
+    logging.info('Applying generated kubevirt vm manifest for build instance.')
+    try:
+        manifest_output = subprocess.check_output(['kubectl', 'apply', '-f', '-'], universal_newlines=True,
+                                                  input=rendered).strip()
+    except subprocess.CalledProcessError:
+        manifest_output = None
+    logging.info('Output from applying manifest is %s', manifest_output)
+
+    instance_ready = False
+    counter = 0
+    while not instance_ready and counter < 60:
+        try:
+            vm_output = subprocess.check_output(['kubectl', 'get', 'vm', myBuild.instancename, '-o', 'json']).strip()
+        except subprocess.CalledProcessError:
+            vm_output = None
+            break
+        # TODO add try for loading json
+        vm_data = json.loads(vm_output)
+        #logging.info('VM output is %s', yaml.dump(vm_data))
+        if vm_data.get('status') and vm_data.get('status').get('ready'):
+            logging.info('kubevirt VM is READY: %s', myBuild.instancename)
+            instance_ready = True
+        else:
+            logging.info('kubevirt VM is NOT READY. printableStatus: %s', vm_data.get('status').get('printableStatus'))
+            #logging.info("vm_data['status'] = \n%s", yaml.dump(vm_data['status']))
+            counter += 1
+            time.sleep(10)
+    # Gather remote ip of pod (with kubevirt instance inside)
+    try:
+        vmi_output = subprocess.check_output(['kubectl', 'get', 'vmi', myBuild.instancename, '-o', 'json']).strip()
+    except subprocess.CalledProcessError:
+        vmi_output = None
+    # TODO add try for loading json
+    vmi_data = json.loads(vmi_output)
+    remoteIp = vmi_data['status']['interfaces'][0]['ipAddress']
+    myBuild.remoteIp = remoteIp
+    myBuild.instanceId = None
+    return myBuild
+
+def dispatchOption(option, args, ssh, myBuild):
     logging.info("%s %s", option, args)
     if option == "testtouch":
-        testtouch(args, connectionObj, myBuild)
+        testtouch(args, ssh, myBuild)
     elif option == "mkdir":
-        makeDirectory(args, connectionObj, myBuild)
+        makeDirectory(args, ssh, myBuild)
     elif option == "filetransfer":
-        fileTransfer(args, connectionObj, myBuild)
+        fileTransferSFTP(args, ssh, myBuild)
+        #fileTransfer(args, ssh, myBuild)
     elif option == "downloads":
-        downloads(args, connectionObj, myBuild)
+        downloads(args, ssh, myBuild)
     elif option == "extract":
-        extract(args, connectionObj, myBuild)
+        extract(args, ssh, myBuild)
     elif option == "reporpms":
-        repoRpms(args, connectionObj, myBuild)
+        repoRpms(args, ssh, myBuild)
     elif option == "pathrpms":
-        pathRpms(args, connectionObj, myBuild)
+        pathRpms(args, ssh, myBuild)
     elif option == "builderdash":
-        builderdash(args, connectionObj, myBuild)
+        builderdash(args, ssh, myBuild)
     elif option == "copyfiles":
-        copyFiles(args, connectionObj, myBuild)
+        copyFiles(args, ssh, myBuild)
     elif option == "movefiles":
-        moveFiles(args, connectionObj, myBuild)
+        moveFiles(args, ssh, myBuild)
     elif option == "copysubtree":
-        copySubtree(args, connectionObj, myBuild)
+        copySubtree(args, ssh, myBuild)
     elif option == "chmod":
-        chmod(args, connectionObj, myBuild)
+        chmod(args, ssh, myBuild)
     elif option == "chown":
-        chown(args, connectionObj, myBuild)
+        chown(args, ssh, myBuild)
     elif option == "sourcescripts":
-        sourceScripts(args, connectionObj, myBuild)
+        sourceScripts(args, ssh, myBuild)
     elif option == "delete":
-        deleteFiles(args, connectionObj, myBuild)
+        deleteFiles(args, ssh, myBuild)
     elif option == "commands":
-        commandsexec(args, connectionObj, myBuild)
+        commandsexec(args, ssh, myBuild)
     elif option == "saveimage":
         savedImage = saveImage(args, myBuild)
     elif option == "deleteinstance":
         deleteInstance(args, myBuild)
     elif option == "append":
-        append(args, connectionObj, myBuild)
+        append(args, ssh, myBuild)
     elif option == "replace":
-        replaceText(args, connectionObj, myBuild)
+        replaceText(args, ssh, myBuild)
     elif option == "npm":
-        npm(args, connectionObj, myBuild)
+        npm(args, ssh, myBuild)
     elif option == "reboot":
-        connectionObj = rebootFunc(args, connectionObj, myBuild)
-        return {'newConnect': connectionObj}
+        rebootFunc(args, ssh, myBuild)
+        # FIXME: this return value is never used by caller of dispatchOption (the function: processSection)
+        #connectionObj = rebootFunc(args, connectionObj, myBuild)
+        #return {'newConnect': connectionObj}
     elif option == "envvar":
-        envVariables(args, connectionObj, myBuild)
+        envVariables(args, ssh, myBuild)
     elif option == "tar":
-        compressOrExtract(args, connectionObj, myBuild)
+        compressOrExtract(args, ssh, myBuild)
     elif option == "cloudyvars":
-        setCloudyClusterEnvVars(connectionObj, myBuild)
+        setCloudyClusterEnvVars(ssh, myBuild)
     else:
         logging.error("Option %s not recognized", option)
         sys.exit(1)
 
-def processSection(configSection, connectionObj, myBuild):
+
+def processSection(configSection, ssh, myBuild):
     myBuild.timesprefix = myBuild.timesprefix + " "
     start_time = time.time()
     for key in configSection:
@@ -487,7 +640,8 @@ def processSection(configSection, connectionObj, myBuild):
                 else:
                     runCheck = False
             if runCheck == True:
-                dispatchOption(newoption, option[name], connectionObj, myBuild)
+                # TODO: Check with Mary: processSection expects this function to return a value (in the case the first arg is 'reboot')
+                dispatchOption(newoption, option[name], ssh, myBuild)
             else:
                 logging.info("Permission Tags Not in Build Type")
         except Exception as e:
@@ -497,57 +651,206 @@ def processSection(configSection, connectionObj, myBuild):
     end_time = time.time()
     myBuild.times.append((myBuild.timesprefix + config_key, end_time - start_time))
 
-######### Handles the creation of the client and connectionObj with paramiko###############
-def sshControl(sshControlCommand, myBuild, connectionObj):
-    logging.info("enteredsshControl")
-    if sshControlCommand == 'connect':
-        logging.info('Connecting...')
-        time.sleep(20)
-        logging.info("Attempting to Connect with ssh client")
-        sshKeyObj = paramiko.RSAKey.from_private_key_file(myBuild.sshkey)
-        connectionObj = paramiko.SSHClient()
-        logging.info('connectionObj returns %s', str(connectionObj))
-        connectionObj.set_missing_host_key_policy(paramiko.WarningPolicy())
-        counter  = 0
-        conn = False
-        
+class SSHConnection:
+    def __init__(self, target_username, target_key_file, target_ip, target_port=22, jump_host_enabled=False,
+                 jump_host_username=None, jump_host_key_file=None, jump_host_external_ip=None,
+                 jump_host_internal_ip=None, jump_host_port=22):
+        self.jump_host_enabled = jump_host_enabled
+        self.target_username = target_username
+        self.target_key_file = target_key_file
+        self.target_ip = target_ip
+        self.target_port = target_port
+        self.jump_host_username = jump_host_username
+        self.jump_host_key_file = jump_host_key_file
+        self.jump_host_external_ip = jump_host_external_ip
+        self.jump_host_internal_ip = jump_host_internal_ip
+        self.jump_host_port = jump_host_port
+        self.jump_host_session = None
+        self.target_session = None
 
+    def connect(self):
+        logging.info('SSHConnection.connect called')
+        if self.jump_host_enabled:
+            self.__jump_host_connect()
+        else:
+            self.__direct_target_connect()
+
+    # Private method called by connect for establishing a ssh connection directly to the target.
+    def __direct_target_connect(self, retry_limit=6, retry_delay=30):
+        logging.info('SSHConnection.__direct_target_connect called')
+        # TODO: what about this function?
+        ssh_key_obj = paramiko.RSAKey.from_private_key_file(self.target_key_file)
+        target_session = paramiko.SSHClient()
+        logging.info('target_session is: %s', str(target_session))
+        target_session.set_missing_host_key_policy(paramiko.WarningPolicy())
+        counter = 0
         while True:
             try:
-                connectionObj.connect(hostname = myBuild.remoteIp, port = 22, username = myBuild.sshkeyuser, pkey = sshKeyObj, look_for_keys = False)
-                logging.info("Connection successful")
+                target_session.connect(hostname=self.target_ip, port=self.target_port,
+                                       username=self.target_username, pkey=ssh_key_obj, look_for_keys=False)
+                logging.info('Connection successful')
                 break
             except Exception as e:
-                logging.error("Error connecting: %s", e)
+                logging.error('Error connecting: %s', e)
                 counter += 1
-                if counter < 6:
-                    logging.info("Trying again")
-                    time.sleep(30)
+                if counter < retry_limit:
+                    logging.info('Trying again after %d seconds', retry_delay)
+                    time.sleep(retry_delay)
                 else:
-                    logging.error("Failed after 6 attempts.  Disconnected")
-                    sys.exit(1)
-                    
-        z = 0
-        return (connectionObj)
-    elif sshControlCommand == 'disconnect':
-        logging.info("Attempting to Disconnect")
-        connectionObj.close()   
-        logging.info("Disconnect Successful")
-    elif sshControlCommand == 'local':
-        logging.info("Local operation")
+                    logging.error('__direct_target_connect failed after %d attempts. Disconnected', retry_limit)
+                    # sys.exit(1)
+                    return
+        self.target_session = target_session
+
+    # Private method called by connect for establishing connection to target via a jump host.
+    def __jump_host_connect(self, retry_limit=6, retry_delay=30):
+        logging.info('SSHConnection.__jump_host_connect called')
+        jump_host_session = paramiko.SSHClient()
+        jump_host_session.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # NOTE there is no retry for connection to the jump_host as it is assumed to be ready and operational.
+        # TODO this assumes jump host uses OpenSSH formatted ssh key. What if PEM formatted? Let's support both types.
+        try:
+            logging.info('Attempting ssh connection via jump_host: %s', {
+                'jump_host_username': self.jump_host_username,
+                'jump_host_key_file': self.jump_host_key_file,
+                'jump_host_external_ip': self.jump_host_external_ip
+            })
+            jump_host_session.connect(hostname=self.jump_host_external_ip, port=self.jump_host_port,
+                                       username=self.jump_host_username, key_filename=self.jump_host_key_file)
+            logging.info('jump_host connection successful')
+        except Exception as e:
+            logging.error('Error connecting to jump_host: %s', e)
+            #sys.exit(1)
+            return
+        jump_host_transport = jump_host_session.get_transport()
+        channel_src_addr = (self.jump_host_internal_ip, self.jump_host_port)
+        channel_dest_addr = (self.target_ip, self.target_port)
+        counter = 0
+        while True:
+            try:
+                logging.info('Opening channel from jump_host to target: %s', {
+                    'channel_dest_addr': channel_dest_addr,
+                    'channel_src_addr': channel_src_addr
+                })
+                jump_host_channel = jump_host_transport.open_channel('direct-tcpip', channel_dest_addr,
+                                                                     channel_src_addr)
+                break
+            except Exception as e:
+                logging.error('Error opening channel from jump_host to target: %s', e)
+                counter += 1
+                if counter < retry_limit:
+                    logging.info('Trying again after %d seconds', retry_delay)
+                    time.sleep(retry_delay)
+                else:
+                    logging.error('__direct_target_connect failed after %d attempts. Disconnected', retry_limit)
+                    jump_host_session.close()
+                    #sys.exit(1)
+                    return
+        target_session = paramiko.SSHClient()
+        target_session.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        counter = 0
+        while True:
+            try:
+                logging.info('connecting to target via jump_host: %s', {
+                    'target_ip': self.target_ip,
+                    'target_username': self.target_username,
+                    'target_key_file': self.target_key_file,
+                    'jump_host_channel': jump_host_channel
+                })
+                target_session.connect(hostname=self.target_ip, username=self.target_username,
+                                        key_filename=self.target_key_file, sock=jump_host_channel)
+                logging.info('target connection successful')
+                break
+            except Exception as e:
+                logging.error('error connecting to target: %s', e)
+                counter += 1
+                if counter < retry_limit:
+                    logging.info('Trying again after %d seconds', retry_delay)
+                    time.sleep(retry_delay)
+                else:
+                    logging.error('__direct_target_connect failed after %d attempts. Disconnected', retry_limit)
+                    jump_host_session.close()
+                    #sys.exit(1)
+                    return
+        self.jump_host_session = jump_host_session
+        self.target_session = target_session
+
+    def disconnect(self):
+        logging.info("SSHConnection.disconnect called: %s", self)
+        try:
+            logging.info('calling self.target_session.close()')
+            self.target_session.close()
+            self.target_session = None
+        except Exception as e:
+            logging.warning('self.target_session.close() failed: %s', e)
+        logging.info('successfully closed self.target_session')
+
+        if self.jump_host_enabled:
+            try:
+                logging.info('calling self.jump_host_session.close()')
+                self.jump_host_session.close()
+                self.jump_host_session = None
+            except Exception as e:
+                logging.warning('self.jump_host_session.close() failed: %s', e)
+            logging.info('successfully closed self.jump_host_session')
+
+    def reconnect(self):
+        logging.info("SSHConnection.reconnect called: %s", self)
+        self.disconnect()
+        self.connect()
+
+    def is_alive(self):
+        logging.info("SSHConnection.is_alive called: %s", self)
+        if self.target_session is None:
+            return False
+
+        transport = self.target_session.get_transport()
+        if not transport.is_active():
+            return False
+
+        try:
+            transport.send_ignore()
+        except EOFError as e:
+            return False
+        return True
+
+    def get_target_session(self):
+        return self.target_session
+
+
+def ssh_connect(myBuild):
+    logging.info('ssh_connect called')
+    if hasattr(myBuild, 'jump_host_enabled') and myBuild.jump_host_enabled:
+        ssh = SSHConnection(myBuild.sshkeyuser, myBuild.sshkey, myBuild.remoteIp, myBuild.target_ssh_port,
+                            myBuild.jump_host_enabled, myBuild.jump_host_ssh_user,
+                            myBuild.jump_host_priv_ssh_key_path, myBuild.jump_host_external_ip_address,
+                            myBuild.jump_host_internal_ip_address, myBuild.jump_host_ssh_port)
+    else:
+        ssh = SSHConnection(myBuild.sshkeyuser, myBuild.sshkey, myBuild.remoteIp, myBuild.target_ssh_port)
+    # TODO handle connection failures and implement retry here
+    ssh.connect()
+    if ssh.is_alive():
+        logging.info('SSH Connection IS ALIIIIIIVE!')
+        #return ssh.get_target_session()
+        return ssh
+    else:
+        logging.error('failed to establish ssh connection to target')
+        ssh.disconnect()
+        #sys.exit(1)
+        return None
+
 
 ###########Run Commands on Instance######################################
-def runCommand(connectionObj, commandString, myBuild, **kwargs):
+def runCommand(ssh, commandString, myBuild, **kwargs):
     if 'local' in kwargs:
         local = kwargs['local']
     else:
         local = myBuild.local
-    # TODO: Local command output should be logged as well.
-    if local == False or local == 'False':
+    if local is False or local == 'False':
         try:
             logging.info("running command as remote: %s", commandString)
             # Send the command (non-blocking)
-            stdin, stdout, stderr = connectionObj.exec_command(commandString, get_pty=True)
+            stdin, stdout, stderr = ssh.get_target_session().exec_command(commandString, get_pty=True)
             # Wait for the command to terminate
             buffer = b""
             # TODO: Can select wait on exit_status as well?
@@ -595,7 +898,7 @@ def runCommand(connectionObj, commandString, myBuild, **kwargs):
         except Exception as e:
             logging.exception('Exception is %s', e)
             sys.exit(1)
-    elif local == True or local == 'True':
+    elif local is True or local == 'True':
         logging.info("running command as local: %s", commandString)
         try:
             # Use a pty so that commands which call isatty don't change behavior.
@@ -638,6 +941,7 @@ def runCommand(connectionObj, commandString, myBuild, **kwargs):
 
 ###########Stops the running instance##############################
 def stopInstance(myBuild):
+    # TODO make stopInstance optional for debugging purposes.
     logging.info("stopping instance...")
     if myBuild.cloudservice == 'aws':
         session = botocore.session.get_session()
@@ -646,6 +950,10 @@ def stopInstance(myBuild):
     elif myBuild.cloudservice == 'gcp':
         compute = googleapiclient.discovery.build('compute', 'v1', cache_discovery=False)
         result = compute.instances().stop(project=myBuild.projectname, zone=myBuild.region, instance=str(myBuild.instancename)).execute()
+    elif myBuild.cloudservice == 'kubevirt':
+        # TODO - actually stop the build for kubevirt.
+        logging.warning("stopInstance is not implemented for cloudservice: kubevirt")
+        pass
     else:
         logging.info("No cloudservice was found in the cfg file. Please put one under the init section in your cfg file")
         sys.exit(1)
@@ -711,23 +1019,38 @@ def saveImage(slist, myBuild):
         response = request.execute()
         logging.info(response)
         savedImage = response
+    elif myBuild.cloudservice == 'kubevirt':
+        # TODO
+        logging.warning('Saving kubevirt image: NOT IMPLEMENTED YET !!!')
+        '''
+        examples using the kubevirt Export API:
+    
+        https://kubevirt.io/user-guide/operations/export_api/
+        
+        # raw
+        virtctl vmexport download vmexportname --vm=builderdash-jdenton-cj-control-20240229-b1f6cf7plus-cc2d --volume=data-volume-disk --format=raw --output=/tmp/disk.img --keep-vme --port-forward
+        
+        # gzip
+        virtctl vmexport download vmexportname --vm=builderdash-jdenton-cj-control-20240229-b1f6cf7plus-cc2d --volume=data-volume-disk --format=gzip --output=/tmp/disk.img.gz --keep-vme --port-forwar    
+        '''
+        savedImage = 'NONE'
     return(savedImage)
 
 ###########Execute a Command As Directly Typed##############################
-def commandsexec(commando, connectionObj, myBuild):
+def commandsexec(commando, ssh, myBuild):
     for key in commando:
         commandString = str(key)
-        runCommand(connectionObj, commandString, myBuild)
+        runCommand(ssh, commandString, myBuild)
 
 #########Just a test function for touching .txt files########################
-def testtouch(touchy, connectionObj, myBuild):
+def testtouch(touchy, ssh, myBuild):
     for key in touchy:
         logging.info(key)
         commandString = 'sudo touch ~/'+str(key)
-        runCommand(connectionObj, commandString, myBuild)
+        runCommand(ssh, commandString, myBuild)
 
 #########Tar Compress or Tar Extract Files#######################################
-def compressOrExtract(tarlist, connectionObj, myBuild):
+def compressOrExtract(tarlist, ssh, myBuild):
     for key in tarlist:
         logging.info(key)
         local = tarlist[key][0]
@@ -737,20 +1060,20 @@ def compressOrExtract(tarlist, connectionObj, myBuild):
         if local == False or local == 'False':
             if action == 'compress':
                 commandString = 'sudo tar -zcvf '+str(tarName)+' '+str(location)
-                runCommand(connectionObj, commandString, myBuild, local=False) 
+                runCommand(ssh, commandString, myBuild, local=False)
             elif action == 'extract':
                 commandString = 'sudo tar -zxvf '+str(tarName)+' -C '+str(location)
-                runCommand(connectionObj, commandString, myBuild, local=False)
+                runCommand(ssh, commandString, myBuild, local=False)
             else:
                 logging.info("No action was specified in cfg file.  Could not compress or extract tar.")
                 
         elif local == True or local == 'True':
             if action == 'compress':
                 commandString = 'tar -zcvf '+str(tarName)+' '+str(location)
-                runCommand(connectionObj, commandString, myBuild, local=True) 
+                runCommand(ssh, commandString, myBuild, local=True)
             elif action == 'extract':
                 commandString = 'tar -zxvf '+str(tarName)+' -C '+str(location)
-                runCommand(connectionObj, commandString, myBuild, local=True)
+                runCommand(ssh, commandString, myBuild, local=True)
             else:
                 logging.info("No action was specified in cfg file.  Could not compress or extract tar.")
 
@@ -764,99 +1087,127 @@ def get_distribution():
     return(distro)
 
 ##############Run Scripts###########################
-def sourceScripts(sslist, connectionObj, myBuild):
+def sourceScripts(sslist, ssh, myBuild):
     for key in sslist:
         logging.info(key)
-        commandString = 'sudo chmod +x '+str(key)
-        runCommand(connectionObj, commandString, myBuild)
-        commandString = 'sudo '+str(key)
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo chmod +x ' + str(key)
+        runCommand(ssh, commandString, myBuild)
+        commandString = 'sudo ' + str(key)
+        runCommand(ssh, commandString, myBuild)
 
 #################Downloads Files#####################
-def downloads(dllist, connectionObj, myBuild):
+def downloads(dllist, ssh, myBuild):
     for source in dllist:
-        commandString = 'sudo wget -P '+str(dllist[source])+ ' '+str(source)
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo wget -P ' + str(dllist[source]) + ' ' + str(source)
+        runCommand(ssh, commandString, myBuild)
 
 #################Extract Files######################################       
-def extract(exlist, connectionObj, myBuild):
+def extract(exlist, ssh, myBuild):
     for key in exlist:
         filelocation = key
         destination = exlist[key][0]
         extract_method = exlist[key][1]
-        commandString = 'sudo tar '+str(extract_method)+' '+str(filelocation)+' -C '+str(destination)
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo tar ' + str(extract_method) + ' ' + str(filelocation) + ' -C ' + str(destination)
+        runCommand(ssh, commandString, myBuild)
 
 ###############Install from packages###############################
-def repoRpms(rrlist, connectionObj, myBuild):
-    runCommand(connectionObj, "sudo yum install -y " + " ".join(rrlist), myBuild)
+def repoRpms(rrlist, ssh, myBuild):
+    runCommand(ssh, "sudo yum install -y " + " ".join(rrlist), myBuild)
 
 ##############Yum localinstall###########
-def pathRpms(prlist, connectionObj, myBuild):
+def pathRpms(prlist, ssh, myBuild):
     for key in prlist:
         logging.info(key)
-        commandString = 'sudo yum localinstall '+str(key)+' -y'
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo yum localinstall ' + str(key) + ' -y'
+        runCommand(ssh, commandString, myBuild)
 
 ##############Calls another builderdash script###############
-def builderdash(blist, connectionObj, myBuild):
+def builderdash(blist, ssh, myBuild):
     for key in blist:
         logging.info(key)
         logging.info("STARTING======>>>>>>>>>>"+str(key))
         subprocess.call('pwd', shell=True)
-        runBuild(False, myBuild, connectionObj, str(key))
+        runBuild(False, myBuild, ssh, str(key))
 
 #############Copies Files from one location to Another###############
-def copyFiles(cflist, connectionObj, myBuild):
+def copyFiles(cflist, ssh, myBuild):
     for key in cflist:
-        commandString = 'sudo cp '+str(key)+' '+str(cflist[key])
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo cp ' + str(key) + ' ' + str(cflist[key])
+        runCommand(ssh, commandString, myBuild)
 
 #############Move Files from one location to Another###############
-def moveFiles(mflist, connectionObj, myBuild):
+def moveFiles(mflist, ssh, myBuild):
     for key in mflist:
-        commandString = 'sudo mv '+str(key)+' '+str(mflist[key])
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo mv ' + str(key) + ' ' + str(mflist[key])
+        runCommand(ssh, commandString, myBuild)
 
 ################Delete Files#######################################
-def deleteFiles(delist, connectionObj, myBuild):
+def deleteFiles(delist, ssh, myBuild):
     for key in delist:
-        commandString = 'sudo rm '+str(key)
-        runCommand(connectionObj, commandString, myBuild)        
+        commandString = 'sudo rm ' + str(key)
+        runCommand(ssh, commandString, myBuild)
 
 #############Copies a Subtree######################################
-def copySubtree(cslist, connectionObj, myBuild):
+def copySubtree(cslist, ssh, myBuild):
     for key in cslist:
-        commandString = 'sudo cp -R '+str(key)+' '+str(cslist[key])
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo cp -R ' + str(key) + ' ' + str(cslist[key])
+        runCommand(ssh, commandString, myBuild)
 
 #############Change Permissions###############################
-def chmod(cmlist, connectionObj, myBuild):
+def chmod(cmlist, ssh, myBuild):
     for key in cmlist:
-        commandString = 'sudo chmod '+str(cmlist[key])+' '+str(key)
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo chmod ' + str(cmlist[key]) + ' ' + str(key)
+        runCommand(ssh, commandString, myBuild)
 
 #############Change Ownsership###############################
-def chown(colist, connectionObj, myBuild):
+def chown(colist, ssh, myBuild):
     for key in colist:
         options = ''
         group = ''
         file = ''
         if colist[key][0] != '':
-            options = str(colist[key][0])+' '
+            options = str(colist[key][0]) + ' '
         if colist[key][1] != '':
-            group = ':'+str(colist[key][1])
+            group = ':' + str(colist[key][1])
         if colist[key][2] != '':
             file = str(colist[key][2])
-        commandString = 'sudo chown '+options+str(key)+group+' '+file
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo chown ' + options + str(key) + group + ' ' + file
+        runCommand(ssh, commandString, myBuild)
 
-def makeDirectory(mklist, connectionObj, myBuild):
+def makeDirectory(mklist, ssh, myBuild):
     for key in mklist:
-        commandString = 'sudo mkdir '+ str(key)
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = 'sudo mkdir ' + str(key)
+        runCommand(ssh, commandString, myBuild)
 
-def fileTransfer(ftlist, connectionObj, myBuild):
+
+def fileTransferSFTP(file_transfer_list, ssh, build):
+    logging.info("This is file_transfer_list: %s", file_transfer_list)
+    # TODO - implement tostring for SSHConnection
+    logging.info('ssh connection details: %s', ssh)
+    sftp = ssh.get_target_session().open_sftp()
+    for key in file_transfer_list:
+        local_path = file_transfer_list[key][0]
+        remote_path = file_transfer_list[key][1]
+        upload = file_transfer_list[key][2]
+        logging.info({'upload': upload, 'type(upload)': type(upload),
+                      'local_path': local_path, 'remote_path': remote_path})
+        # FIXME: This approach might not be correct and needs more attention
+        # TODO should I implement this workaround the other way? Is upload=False / get even used?
+        if remote_path == '.':
+            remote_path = os.path.basename(local_path)
+            logging.info('remote_path has been automatically changed to basename(local_path), which is: %s',
+                         remote_path)
+        if upload:
+            logging.info("before sftp file put")
+            sftp.put(local_path, remote_path)
+        else:
+            logging.info("before sftp file get")
+            sftp.get(remote_path, local_path)
+        logging.info("after sftp transfer")
+    sftp.close()
+
+
+def fileTransfer(ftlist, ssh, myBuild):
     user = "%s@%s:" % (myBuild.sshkeyuser, myBuild.remoteIp)
     logging.info("This is ftlist: %s", ftlist)
     for key in ftlist:
@@ -865,17 +1216,15 @@ def fileTransfer(ftlist, connectionObj, myBuild):
         upload = ftlist[key][2]
         logging.info("This is sourcepath: %s \n This is user: %s \n This is destination: %s \n" % (sourcepath, user, destination))
         logging.info("upload is %s; type %s", upload, type(upload))
-        logging.info("Yo mama")
         if upload:
             logging.info("It this one!")
             commandString = "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i %s %s %s" % (myBuild.sshkey, sourcepath, user + destination)
         else:
             logging.info("No this one!")
             commandString = "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i %s %s %s" % (myBuild.sshkey, user + sourcepath, destination)
-        logging.info("gay")
         logging.info("commandString is %s", commandString)
         logging.info("before runCommand FT")
-        runCommand(connectionObj, commandString, myBuild, local=True)
+        runCommand(ssh, commandString, myBuild, local=True)
         logging.info("after runCommand FT")
 
 def deleteInstance(delList, myBuild):
@@ -899,19 +1248,22 @@ def deleteInstance(delList, myBuild):
             logging.info(deleteResponse)
             if deleteResponse['status'] == "PENDING" or deleteResponse['status'] == "RUNNING":
                 deleted = True
+    elif myBuild.cloudservice == 'kubevirt':
+        # TODO
+        logging.error('TODO implement deleteInstance for kubevirt!!!')
     else:
         logging.info("No proper cloud service listed in Init Section of cfg file.")
 
 ########Append Files############
-def append(applist, connectionObj, myBuild):
+def append(applist, ssh, myBuild):
     for key in applist:
         file = str(key)
         appendtext = re.escape(applist[key])
-        commandString = "sudo sed -i '$ a\\"+appendtext+"' "+file
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = "sudo sed -i '$ a\\" + appendtext + "' " + file
+        runCommand(ssh, commandString, myBuild)
 
 #####Replace text Function->>>Work in progress#########
-def replaceText(replace, connectionObj, myBuild):
+def replaceText(replace, ssh, myBuild):
     for key in replace:
         for subkey in replace[key]:
             file = key
@@ -926,54 +1278,61 @@ def replaceText(replace, connectionObj, myBuild):
             logging.info(totaltext)
             #commandString = "sudo sed -i 's/"+str(oldtext)+"/"+str(newtext)+"/g' "+str(file)
             commandString = totaltext
-            runCommand(connectionObj, commandString, myBuild)
+            runCommand(ssh, commandString, myBuild)
 
 ######Handle npm's################
-def npm(nplist, connectionObj, myBuild):
+def npm(nplist, ssh, myBuild):
     for x in range(len(nplist)):
         targ = nplist[x]
         for y in targ:
             key = y
             value = targ[y]
             if value != '':
-                commandString = "sudo npm install --prefix "+str(value)+" "+str(key)
-                runCommand(connectionObj, commandString, myBuild)
+                commandString = "sudo npm install --prefix " + str(value) + " " + str(key)
+                runCommand(ssh, commandString, myBuild)
             else:
-                commandString = "sudo npm install "+str(key)
-                runCommand(connectionObj, commandString, myBuild)
+                commandString = "sudo npm install " + str(key)
+                runCommand(ssh, commandString, myBuild)
+
 
 #########Handle reboots ##########################
-def rebootFunc(rebootCheck, connectionObj, myBuild):
-    if myBuild.cloudservice == "aws" or "gcp":
+def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=3):
+    if myBuild.cloudservice in ("aws", "gcp", "kubevirt"):
         commandString = "sudo reboot"
-        runCommand(connectionObj, commandString, myBuild)
+        runCommand(ssh, commandString, myBuild)
         counter = 0
         logging.info("Attempting to reconnect after reboot")
         while True:
-            time.sleep(180)
+            time.sleep(connection_delay)
             try:
-                connectionObj = sshControl('connect', myBuild, connectionObj)
+                ssh = ssh_connect(myBuild)
                 logging.info("Connection successful")
                 break
-            except:
+            except Exception as e:
                 logging.info("Error reconnecting, trying again")
                 counter += 1
-                if counter < 3:
+                if counter < retry_limit:
                     pass
                 else:
                     logging.exception("Reboot Failed")
                     sys.exit(1)
-                    break
-    return(connectionObj)
+    # TODO how does this ever get used? It seems to not be passed up to processSection
+    #return connectionObj
+    return ssh
+
+
 #######Set Environment Variables.  TODO##############################
-def envVariables(varlist, connectionObj, myBuild):
+def envVariables(varlist, ssh, myBuild):
     for key in varlist:
-        commandString = "sudo sed -i \'$ aexport "+str(key)+"='"+str(varlist[key])+"'\' /etc/profile"
-        runCommand(connectionObj, commandString, myBuild)
+        commandString = "sudo sed -i \'$ aexport " + str(key) + "='" + str(varlist[key]) + "'\' /etc/profile"
+        runCommand(ssh, commandString, myBuild)
+
 
 ##############Mod File#######################
 def modFile():
     pass
+
+
 ######Handle User Data ####################
 def handleUserData(myBuild):
     if hasattr(myBuild, 'userdata'):
@@ -984,6 +1343,7 @@ def handleUserData(myBuild):
         myBuild.userdata = ""
     myBuild.userdata = str(myBuild.userdata)
     return myBuild
+
 
 def parseConfig(scriptName):
     cp = configparser.SafeConfigParser()
@@ -1007,7 +1367,7 @@ def parseConfig(scriptName):
 
     return config
 
-def runBuild(root, myBuild, connectionObj, scriptName):
+def runBuild(root, myBuild, ssh, scriptName):
     if scriptName.endswith(".json"):
         with open(scriptName) as f:
             config = json.load(f.read())
@@ -1025,25 +1385,32 @@ def runBuild(root, myBuild, connectionObj, scriptName):
 
     try:
         if root:
-            initSection = config[0]
-            connectionObj = processInitSection(config[0], connectionObj, myBuild)
+            ssh = processInitSection(config[0], myBuild)
             rest = config[1:]
         else:
             rest = config
 
         for section in rest:
+            processSection(section, ssh, myBuild)
+            # FIXME: processSection never returns a value so the following never runs
+            '''
             x = processSection(section, connectionObj, myBuild)
             if hasattr(x, 'newConnect'):
                 connectionObj = x['newConnect']
+            '''
     except Exception as e:
         logging.exception("Error in initReturnList")
         stopInstance(myBuild)
 
     if root:
+        ssh.disconnect()
+        # TODO delete this after testing refactor of connectionObj to SSHConnection
+        '''
         try:
-            sshControl('disconnect', myBuild, connectionObj)
+            sshControl('disconnect', myBuild, connectionObj)    
         except Exception as e:
             logging.exception("No connection exists, no need to disconnect")
+        '''
 
 class CommandFilter(logging.Filter):
     def filter(self, record):

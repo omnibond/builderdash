@@ -12,6 +12,13 @@ setuptools.setup(
     url="https://www.cloudycluster.com/",
     packages=setuptools.find_packages(),
     python_requires='>=3.6',
+    install_requires=[
+        'botocore',
+        'google-api-python-client',
+        'paramiko',
+        'requests',
+        'pyyaml'
+    ],
     entry_points={
         "console_scripts": ["builderdash = builderdash.main:main"]
     }

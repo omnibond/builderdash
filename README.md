@@ -41,3 +41,7 @@ List of arguments:
 * `-v, --verbosity`: Specifies the verbosity level for logging (0 none,
   10 debug, 20 error, 30 warning, 40 info, 50 critical)",
   required=False, default=30)
+
+### Development / Editable Installation
+NOTE: For an editable, development installation of builderdash (along with its dependencies), run:
+`pip install -e .`

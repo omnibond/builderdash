@@ -1,3 +1,5 @@
 build
 builderdash.egg-info
 dist
+.idea/
+**/.DS_Store
