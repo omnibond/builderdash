@@ -674,17 +674,17 @@ def processSection(configSection, ssh, myBuild):
 def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
     logging.info('ssh_connect called')
     # TODO clean up variable names below
-    if hasattr(myBuild, 'jump_host_external_ip_address') and myBuild.jump_host_external_ip_address is not None:
+    if hasattr(myBuild, 'proxy_external_ip_address') and myBuild.proxy_external_ip_address is not None:
         ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
                             target_timeout=timeout, target_attempt_limit=attempt_limit, target_retry_delay=retry_delay,
                             target_missing_host_key_policy=paramiko.WarningPolicy(),
-                            proxy_hostname=myBuild.jump_host_external_ip_address, proxy_port=myBuild.jump_host_ssh_port,
-                            proxy_username=myBuild.jump_host_ssh_user,
-                            proxy_key_filename=myBuild.jump_host_priv_ssh_key_path,
+                            proxy_hostname=myBuild.proxy_external_ip_address, proxy_port=myBuild.proxy_ssh_port,
+                            proxy_username=myBuild.proxy_ssh_user,
+                            proxy_key_filename=myBuild.proxy_priv_ssh_key_path,
                             proxy_timeout=timeout, proxy_attempt_limit=attempt_limit, proxy_retry_delay=retry_delay,
                             proxy_missing_host_key_policy=paramiko.WarningPolicy(),
-                            proxy_channel_alt_src_hostname=myBuild.jump_host_internal_ip_address)
+                            proxy_channel_alt_src_hostname=myBuild.proxy_internal_ip_address)
     else:
         ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
