@@ -4,25 +4,28 @@
 #Terms of Service are located at:
 #http://www.cloudycluster.com/termsofservice
 import argparse
-import configparser
-import os
-import sys
-import platform
-import subprocess
 import ast
-import paramiko
+import configparser
+import datetime
+import json
 import logging
+import os
+import platform
+import random
+import re
+import subprocess
+import sys
+import time
+from textwrap import dedent
+
 import botocore
 import botocore.session
 import googleapiclient.discovery
-import time
-import datetime
-import select
-import re
-import json
+import paramiko
 import yaml
-import random
-from textwrap import dedent
+
+from builderdash.ssher import SSHConnection
+
 
 class Build():
     def setup(self, configSection):
@@ -105,12 +108,18 @@ def processInitSection(configSection, myBuild):
         # Give instance time to boot, for ssh service to come up, and for cloudinit to run, etc.
         time.sleep(20)
         ssh = ssh_connect(myBuild)
+        if ssh is None:
+            logging.error('ssh_connect returned None. Stopping instance and aborting build!')
+            stopInstance(myBuild)
+            sys.exit(1)
+
         logging.info('osType inside process init is %s', str(myBuild.ostype))
 
         # TODO why are we installing wget here? Can this be cleaned up?
         run_cmd = 'sudo yum install wget -y'
         logging.info('calling exec_command on: %s', run_cmd)
-        stdin, stdout, stderr = ssh.get_target_session().exec_command(run_cmd, get_pty=True)
+        # TODO use ssh.run_command instead, as is done further down in this file
+        stdin, stdout, stderr = ssh.get_target_client().exec_command(run_cmd, get_pty=True)
         run_ret = stdout.channel.recv_exit_status()
         logging.info('exec_command returned: %d', run_ret)
         #logging.info('exec_command stdout: %s', stdout)
@@ -484,7 +493,7 @@ def kubevirt_instance(myBuild):
         kubevirt_public_key_openssh = f.read()
 
     d = {'name': myBuild.instancename,
-         'namespace': 'default',
+         'namespace': myBuild.kubevirt_namespace,
          'labels': {},
          'instance_state': 'true',
          'instance_type_kind': 'VirtualMachineInstancetype',
@@ -493,18 +502,26 @@ def kubevirt_instance(myBuild):
          'data_volume_disk_name': 'data-volume-disk',
          'ssh_user': str(myBuild.sshkeyuser),
          'public_key_openssh': kubevirt_public_key_openssh,
-         'data_volume_name': 'data-volume-' + myBuild.instancename,
+         'data_volume_name': 'root-data-volume-' + myBuild.instancename,
          'data_volume_pvc_access_mode': 'ReadWriteOnce',
          'data_volume_pvc_storage_capacity': disksize,
          'data_volume_source_http_url': myBuild.sourceimage,
-         'plain_text_passwd': myBuild.plain_text_passwd
+         'plain_text_passwd': myBuild.kubevirt_plain_text_passwd
         }
     rendered = kv_inst_tmpl.format(**d)
+    # TODO use unique file name below to support multiple concurrent kubevirt builds
     with open('/tmp/builderdash-kubevirt-instance-manifest.yaml', 'w') as wf:
         wf.write(rendered)
     logging.info('myBuild.cloudservice is: %s', myBuild.cloudservice)
     logging.info('myBuild.instancename is: %s', myBuild.instancename)
     logging.info('Applying generated kubevirt vm manifest for build instance.')
+    # ------------------------------------------------------------------------------------------------------------------
+    # TODO: enable support for customizing k8s kube config path and config context.
+    # Currently using:
+    #   - default kube config path:     ~/.kube/config
+    #   - default config context:       "default"
+    # Need add associated variables to myBuild and determine how to cause kubectl to use them
+    # ------------------------------------------------------------------------------------------------------------------
     try:
         manifest_output = subprocess.check_output(['kubectl', 'apply', '-f', '-'], universal_newlines=True,
                                                   input=rendered).strip()
@@ -549,9 +566,11 @@ def dispatchOption(option, args, ssh, myBuild):
         testtouch(args, ssh, myBuild)
     elif option == "mkdir":
         makeDirectory(args, ssh, myBuild)
-    elif option == "filetransfer":
-        fileTransferSFTP(args, ssh, myBuild)
-        #fileTransfer(args, ssh, myBuild)
+    elif option == "upload_files":
+        upload_files(args, ssh)
+    # TODO
+    #elif option == "download_files":
+    #    download_files(args, ssh)
     elif option == "downloads":
         downloads(args, ssh, myBuild)
     elif option == "extract":
@@ -651,193 +670,36 @@ def processSection(configSection, ssh, myBuild):
     end_time = time.time()
     myBuild.times.append((myBuild.timesprefix + config_key, end_time - start_time))
 
-class SSHConnection:
-    def __init__(self, target_username, target_key_file, target_ip, target_port=22, jump_host_enabled=False,
-                 jump_host_username=None, jump_host_key_file=None, jump_host_external_ip=None,
-                 jump_host_internal_ip=None, jump_host_port=22):
-        self.jump_host_enabled = jump_host_enabled
-        self.target_username = target_username
-        self.target_key_file = target_key_file
-        self.target_ip = target_ip
-        self.target_port = target_port
-        self.jump_host_username = jump_host_username
-        self.jump_host_key_file = jump_host_key_file
-        self.jump_host_external_ip = jump_host_external_ip
-        self.jump_host_internal_ip = jump_host_internal_ip
-        self.jump_host_port = jump_host_port
-        self.jump_host_session = None
-        self.target_session = None
 
-    def connect(self):
-        logging.info('SSHConnection.connect called')
-        if self.jump_host_enabled:
-            self.__jump_host_connect()
-        else:
-            self.__direct_target_connect()
-
-    # Private method called by connect for establishing a ssh connection directly to the target.
-    def __direct_target_connect(self, retry_limit=6, retry_delay=30):
-        logging.info('SSHConnection.__direct_target_connect called')
-        # TODO: what about this function?
-        ssh_key_obj = paramiko.RSAKey.from_private_key_file(self.target_key_file)
-        target_session = paramiko.SSHClient()
-        logging.info('target_session is: %s', str(target_session))
-        target_session.set_missing_host_key_policy(paramiko.WarningPolicy())
-        counter = 0
-        while True:
-            try:
-                target_session.connect(hostname=self.target_ip, port=self.target_port,
-                                       username=self.target_username, pkey=ssh_key_obj, look_for_keys=False)
-                logging.info('Connection successful')
-                break
-            except Exception as e:
-                logging.error('Error connecting: %s', e)
-                counter += 1
-                if counter < retry_limit:
-                    logging.info('Trying again after %d seconds', retry_delay)
-                    time.sleep(retry_delay)
-                else:
-                    logging.error('__direct_target_connect failed after %d attempts. Disconnected', retry_limit)
-                    # sys.exit(1)
-                    return
-        self.target_session = target_session
-
-    # Private method called by connect for establishing connection to target via a jump host.
-    def __jump_host_connect(self, retry_limit=6, retry_delay=30):
-        logging.info('SSHConnection.__jump_host_connect called')
-        jump_host_session = paramiko.SSHClient()
-        jump_host_session.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        # NOTE there is no retry for connection to the jump_host as it is assumed to be ready and operational.
-        # TODO this assumes jump host uses OpenSSH formatted ssh key. What if PEM formatted? Let's support both types.
-        try:
-            logging.info('Attempting ssh connection via jump_host: %s', {
-                'jump_host_username': self.jump_host_username,
-                'jump_host_key_file': self.jump_host_key_file,
-                'jump_host_external_ip': self.jump_host_external_ip
-            })
-            jump_host_session.connect(hostname=self.jump_host_external_ip, port=self.jump_host_port,
-                                       username=self.jump_host_username, key_filename=self.jump_host_key_file)
-            logging.info('jump_host connection successful')
-        except Exception as e:
-            logging.error('Error connecting to jump_host: %s', e)
-            #sys.exit(1)
-            return
-        jump_host_transport = jump_host_session.get_transport()
-        channel_src_addr = (self.jump_host_internal_ip, self.jump_host_port)
-        channel_dest_addr = (self.target_ip, self.target_port)
-        counter = 0
-        while True:
-            try:
-                logging.info('Opening channel from jump_host to target: %s', {
-                    'channel_dest_addr': channel_dest_addr,
-                    'channel_src_addr': channel_src_addr
-                })
-                jump_host_channel = jump_host_transport.open_channel('direct-tcpip', channel_dest_addr,
-                                                                     channel_src_addr)
-                break
-            except Exception as e:
-                logging.error('Error opening channel from jump_host to target: %s', e)
-                counter += 1
-                if counter < retry_limit:
-                    logging.info('Trying again after %d seconds', retry_delay)
-                    time.sleep(retry_delay)
-                else:
-                    logging.error('__direct_target_connect failed after %d attempts. Disconnected', retry_limit)
-                    jump_host_session.close()
-                    #sys.exit(1)
-                    return
-        target_session = paramiko.SSHClient()
-        target_session.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        counter = 0
-        while True:
-            try:
-                logging.info('connecting to target via jump_host: %s', {
-                    'target_ip': self.target_ip,
-                    'target_username': self.target_username,
-                    'target_key_file': self.target_key_file,
-                    'jump_host_channel': jump_host_channel
-                })
-                target_session.connect(hostname=self.target_ip, username=self.target_username,
-                                        key_filename=self.target_key_file, sock=jump_host_channel)
-                logging.info('target connection successful')
-                break
-            except Exception as e:
-                logging.error('error connecting to target: %s', e)
-                counter += 1
-                if counter < retry_limit:
-                    logging.info('Trying again after %d seconds', retry_delay)
-                    time.sleep(retry_delay)
-                else:
-                    logging.error('__direct_target_connect failed after %d attempts. Disconnected', retry_limit)
-                    jump_host_session.close()
-                    #sys.exit(1)
-                    return
-        self.jump_host_session = jump_host_session
-        self.target_session = target_session
-
-    def disconnect(self):
-        logging.info("SSHConnection.disconnect called: %s", self)
-        try:
-            logging.info('calling self.target_session.close()')
-            self.target_session.close()
-            self.target_session = None
-        except Exception as e:
-            logging.warning('self.target_session.close() failed: %s', e)
-        logging.info('successfully closed self.target_session')
-
-        if self.jump_host_enabled:
-            try:
-                logging.info('calling self.jump_host_session.close()')
-                self.jump_host_session.close()
-                self.jump_host_session = None
-            except Exception as e:
-                logging.warning('self.jump_host_session.close() failed: %s', e)
-            logging.info('successfully closed self.jump_host_session')
-
-    def reconnect(self):
-        logging.info("SSHConnection.reconnect called: %s", self)
-        self.disconnect()
-        self.connect()
-
-    def is_alive(self):
-        logging.info("SSHConnection.is_alive called: %s", self)
-        if self.target_session is None:
-            return False
-
-        transport = self.target_session.get_transport()
-        if not transport.is_active():
-            return False
-
-        try:
-            transport.send_ignore()
-        except EOFError as e:
-            return False
-        return True
-
-    def get_target_session(self):
-        return self.target_session
-
-
-def ssh_connect(myBuild):
+def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
     logging.info('ssh_connect called')
-    if hasattr(myBuild, 'jump_host_enabled') and myBuild.jump_host_enabled:
-        ssh = SSHConnection(myBuild.sshkeyuser, myBuild.sshkey, myBuild.remoteIp, myBuild.target_ssh_port,
-                            myBuild.jump_host_enabled, myBuild.jump_host_ssh_user,
-                            myBuild.jump_host_priv_ssh_key_path, myBuild.jump_host_external_ip_address,
-                            myBuild.jump_host_internal_ip_address, myBuild.jump_host_ssh_port)
+    # TODO clean up variable names below
+    if hasattr(myBuild, 'jump_host_external_ip_address') and myBuild.jump_host_external_ip_address is not None:
+        ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
+                            target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
+                            target_timeout=timeout, target_attempt_limit=attempt_limit, target_retry_delay=retry_delay,
+                            target_missing_host_key_policy=paramiko.WarningPolicy(),
+                            proxy_hostname=myBuild.jump_host_external_ip_address, proxy_port=myBuild.jump_host_ssh_port,
+                            proxy_username=myBuild.jump_host_ssh_user,
+                            proxy_key_filename=myBuild.jump_host_priv_ssh_key_path,
+                            proxy_timeout=timeout, proxy_attempt_limit=attempt_limit, proxy_retry_delay=retry_delay,
+                            proxy_missing_host_key_policy=paramiko.WarningPolicy(),
+                            proxy_channel_alt_src_hostname=myBuild.jump_host_internal_ip_address)
     else:
-        ssh = SSHConnection(myBuild.sshkeyuser, myBuild.sshkey, myBuild.remoteIp, myBuild.target_ssh_port)
-    # TODO handle connection failures and implement retry here
-    ssh.connect()
-    if ssh.is_alive():
-        logging.info('SSH Connection IS ALIIIIIIVE!')
-        #return ssh.get_target_session()
-        return ssh
-    else:
-        logging.error('failed to establish ssh connection to target')
+        ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
+                            target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
+                            target_timeout=timeout, target_attempt_limit=attempt_limit,
+                            target_missing_host_key_policy=paramiko.WarningPolicy())
+    try:
+        ssh.connect()
+    except Exception as e:
+        logging.error('SSH Connection failed: %s', e)
         ssh.disconnect()
-        #sys.exit(1)
         return None
+    else:
+        if ssh.is_alive():
+            logging.info('SSH Connection IS ALIIIIIIVE!')
+            return ssh
 
 
 ###########Run Commands on Instance######################################
@@ -849,52 +711,16 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
     if local is False or local == 'False':
         try:
             logging.info("running command as remote: %s", commandString)
-            # Send the command (non-blocking)
-            stdin, stdout, stderr = ssh.get_target_session().exec_command(commandString, get_pty=True)
-            # Wait for the command to terminate
-            buffer = b""
-            # TODO: Can select wait on exit_status as well?
-            while not stdout.channel.exit_status_ready():
-                rl, wl, xl = select.select([stdout.channel, stderr.channel], [], [], 1)
-                # Standard output and standard error are mixed.
-                for s in rl:
-                    output = s.recv(1024)
-                    if output != None:
-                        sys.stdout.buffer.write(output)
-                        sys.stdout.flush()
-                        buffer += output
-                # Buffer until newline since the log module will insert
-                # its own newline.  Logging output will not go to stdout
-                # since that is already done.
-                list = buffer.split(b"\n")
-                for line in list[:-1]:
-                    logging.info("%s", line.decode(), extra={"commandoutput": True})
-                buffer = list[-1]
-            while stdout.channel.recv_ready():
-                output = stdout.channel.recv(1024)
-                if output != None:
-                    sys.stdout.buffer.write(output)
-                    sys.stdout.flush()
-                    buffer += output
-            while stderr.channel.recv_ready():
-                output = stderr.channel.recv(1024)
-                if output != None:
-                    sys.stdout.buffer.write(output)
-                    sys.stdout.flush()
-                    buffer += output
-            list = buffer.split(b"\n")
-            for line in list[:-1]:
-                logging.info("%s", line.decode(), extra={"commandoutput": True})
-            buffer = list[-1]
-            if len(buffer):
-                logging.info("%s", buffer.decode(), extra={"commandoutput": True})
-            status = stdout.channel.recv_exit_status()
+            # Send the command (blocking)
+            status, _, _ = ssh.run_command(commandString, get_pty=True,
+                                           stdout_log_func=logging.info, stderr_log_func=None,
+                                           ret_stdout=False, ret_stderr=False,
+                                           stdout_extra={"commandoutput": True}, stderr_extra=None)
             logging.info("Exit status is %d", status)
             if status != 0:
                 logging.exception('ERROR running command')
                 stopInstance(myBuild)
                 sys.exit(1)
-            lines = stdout.readlines()
         except Exception as e:
             logging.exception('Exception is %s', e)
             sys.exit(1)
@@ -951,9 +777,11 @@ def stopInstance(myBuild):
         compute = googleapiclient.discovery.build('compute', 'v1', cache_discovery=False)
         result = compute.instances().stop(project=myBuild.projectname, zone=myBuild.region, instance=str(myBuild.instancename)).execute()
     elif myBuild.cloudservice == 'kubevirt':
-        # TODO - actually stop the build for kubevirt.
-        logging.warning("stopInstance is not implemented for cloudservice: kubevirt")
-        pass
+        try:
+            stop_vmi_output = subprocess.check_output(['kubectl', 'patch', 'virtualmachine', myBuild.instancename,
+                                                       '--type', 'merge', '-p', '{"spec":{"running":false}}']).strip()
+        except subprocess.CalledProcessError:
+            stop_vmi_output = None
     else:
         logging.info("No cloudservice was found in the cfg file. Please put one under the init section in your cfg file")
         sys.exit(1)
@@ -1020,20 +848,15 @@ def saveImage(slist, myBuild):
         logging.info(response)
         savedImage = response
     elif myBuild.cloudservice == 'kubevirt':
-        # TODO
-        logging.warning('Saving kubevirt image: NOT IMPLEMENTED YET !!!')
-        '''
-        examples using the kubevirt Export API:
-    
-        https://kubevirt.io/user-guide/operations/export_api/
-        
-        # raw
-        virtctl vmexport download vmexportname --vm=builderdash-jdenton-cj-control-20240229-b1f6cf7plus-cc2d --volume=data-volume-disk --format=raw --output=/tmp/disk.img --keep-vme --port-forward
-        
-        # gzip
-        virtctl vmexport download vmexportname --vm=builderdash-jdenton-cj-control-20240229-b1f6cf7plus-cc2d --volume=data-volume-disk --format=gzip --output=/tmp/disk.img.gz --keep-vme --port-forwar    
-        '''
-        savedImage = 'NONE'
+        logging.info('Saving kubevirt image -- really just recording a reference to the build instance persistent volume claim name and namespace.')
+        savedImage = {
+            "pvc": {
+                "name": 'root-data-volume-' + myBuild.instancename,
+                "namespace": myBuild.kubevirt_namespace
+            }
+        }
+        logging.info('kubevirt pvc: ' + json.dumps(savedImage))
+    # TODO: even though savedImage is returned is it ever really used?
     return(savedImage)
 
 ###########Execute a Command As Directly Typed##############################
@@ -1180,52 +1003,22 @@ def makeDirectory(mklist, ssh, myBuild):
         runCommand(ssh, commandString, myBuild)
 
 
-def fileTransferSFTP(file_transfer_list, ssh, build):
-    logging.info("This is file_transfer_list: %s", file_transfer_list)
-    # TODO - implement tostring for SSHConnection
-    logging.info('ssh connection details: %s', ssh)
-    sftp = ssh.get_target_session().open_sftp()
-    for key in file_transfer_list:
-        local_path = file_transfer_list[key][0]
-        remote_path = file_transfer_list[key][1]
-        upload = file_transfer_list[key][2]
-        logging.info({'upload': upload, 'type(upload)': type(upload),
-                      'local_path': local_path, 'remote_path': remote_path})
-        # FIXME: This approach might not be correct and needs more attention
-        # TODO should I implement this workaround the other way? Is upload=False / get even used?
-        if remote_path == '.':
-            remote_path = os.path.basename(local_path)
-            logging.info('remote_path has been automatically changed to basename(local_path), which is: %s',
-                         remote_path)
-        if upload:
-            logging.info("before sftp file put")
-            sftp.put(local_path, remote_path)
-        else:
-            logging.info("before sftp file get")
-            sftp.get(remote_path, local_path)
-        logging.info("after sftp transfer")
-    sftp.close()
+def upload_files(uploads, ssh):
+    logging.info('upload_files called with uploads: %s', uploads)
+    for upload in uploads:
+        src = upload[0]
+        dst = upload[1]
+        try:
+            ssh.file_upload(src, dst)
+        except Exception as e:
+            logging.error("upload_files raised an exception: %s", e)
+            # FIXME uncomment line below after stopInstance for kubevirt works better
+            #stopInstance(myBuild)
+            sys.exit(1)
+    logging.info("upload_files raised no exceptions.")
 
+# TODO download_files
 
-def fileTransfer(ftlist, ssh, myBuild):
-    user = "%s@%s:" % (myBuild.sshkeyuser, myBuild.remoteIp)
-    logging.info("This is ftlist: %s", ftlist)
-    for key in ftlist:
-        sourcepath = ftlist[key][0]
-        destination = ftlist[key][1]
-        upload = ftlist[key][2]
-        logging.info("This is sourcepath: %s \n This is user: %s \n This is destination: %s \n" % (sourcepath, user, destination))
-        logging.info("upload is %s; type %s", upload, type(upload))
-        if upload:
-            logging.info("It this one!")
-            commandString = "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i %s %s %s" % (myBuild.sshkey, sourcepath, user + destination)
-        else:
-            logging.info("No this one!")
-            commandString = "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i %s %s %s" % (myBuild.sshkey, user + sourcepath, destination)
-        logging.info("commandString is %s", commandString)
-        logging.info("before runCommand FT")
-        runCommand(ssh, commandString, myBuild, local=True)
-        logging.info("after runCommand FT")
 
 def deleteInstance(delList, myBuild):
     if myBuild.cloudservice == 'aws':
@@ -1249,8 +1042,27 @@ def deleteInstance(delList, myBuild):
             if deleteResponse['status'] == "PENDING" or deleteResponse['status'] == "RUNNING":
                 deleted = True
     elif myBuild.cloudservice == 'kubevirt':
-        # TODO
-        logging.error('TODO implement deleteInstance for kubevirt!!!')
+        logging.info('Deleting kubevirt instance: (actually, just stopping instance for now)' + myBuild.instancename)
+        # For kubevirt, I think the instance needs to be stopped first; otherwise, deleting the vm will hang until it's stopped.
+        stopInstance(myBuild)
+        """
+        try:
+            delete_vmi_output = subprocess.check_output(['kubectl', 'delete', 'vmi', myBuild.instancename,
+                                                       '--cascade=orphan']).strip()
+            logging.info('delete_vmi_output is: %s', delete_vmi_output)
+        except subprocess.CalledProcessError:
+            logging.error('kubectl failed to delete vmi')
+        """
+        # TODO THIS STILL HANGS!
+        """
+        try:
+            delete_vm_output = subprocess.check_output(['kubectl', 'delete', 'vm', myBuild.instancename,
+                                                       '--cascade=orphan']).strip()
+            logging.info('delete_vm_output is: %s', delete_vm_output)
+        except subprocess.CalledProcessError:
+            logging.error('kubectl failed to delete vm')
+            pass
+        """
     else:
         logging.info("No proper cloud service listed in Init Section of cfg file.")
 
