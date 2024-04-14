@@ -33,18 +33,18 @@ def ssh_run_cmd(ssh_client, command, timeout=1.0, get_pty=True, stdout_log_func=
                 this_stdout_chunk = chan.recv(len(c.in_buffer))
 
                 if stdout_log_func is not None:
-                    lines = this_stdout_chunk.split(b'\n')
-                    # len of lines will always be >= 1
-                    lines[0] = left_over_stdout + lines[0]
+                    lines = this_stdout_chunk.splitlines()
+                    if len(lines):
+                        lines[0] = left_over_stdout + lines[0]
 
-                    if len(lines) > 1:
+                    if this_stdout_chunk.endswith(b'\n'):
+                        left_over_stdout = b''
+                    else:
                         left_over_stdout = lines[-1]
                         del (lines[-1])
-                    else:
-                        left_over_stdout = b''
 
                     for idx, line in enumerate(lines):
-                        line_out = line.decode(encoding='utf-8', errors='ignore').replace('\r', '')
+                        line_out = line.decode(encoding='utf-8', errors='ignore')
                         if len(line_out):
                             stdout_log_func("%s", line_out, extra=stdout_extra)
                 if ret_stdout:
@@ -54,18 +54,18 @@ def ssh_run_cmd(ssh_client, command, timeout=1.0, get_pty=True, stdout_log_func=
                 this_stderr_chunk = chan.recv_stderr(len(c.in_stderr_buffer))
 
                 if stderr_log_func is not None:
-                    lines = this_stderr_chunk.split(b'\n')
-                    # len of lines will always be >= 1
-                    lines[0] = left_over_stderr + lines[0]
+                    lines = this_stderr_chunk.splitlines()
+                    if len(lines):
+                        lines[0] = left_over_stderr + lines[0]
 
-                    if len(lines) > 1:
+                    if this_stderr_chunk.endswith(b'\n'):
+                        left_over_stderr = b''
+                    else:
                         left_over_stderr = lines[-1]
                         del (lines[-1])
-                    else:
-                        left_over_stderr = b''
 
                     for idx, line in enumerate(lines):
-                        line_out = line.decode(encoding='utf-8', errors='ignore').replace('\r', '')
+                        line_out = line.decode(encoding='utf-8', errors='ignore')
                         if len(line_out):
                             stderr_log_func("%s", line_out, extra=stderr_extra)
                 if ret_stderr:
@@ -83,11 +83,11 @@ def ssh_run_cmd(ssh_client, command, timeout=1.0, get_pty=True, stdout_log_func=
     stderr.close()
 
     if stdout_log_func is not None:
-        line_out = left_over_stdout.decode(encoding='utf-8', errors='ignore').replace('\r', '')
+        line_out = left_over_stdout.decode(encoding='utf-8', errors='ignore')
         if len(line_out):
             stdout_log_func("%s", line_out, extra=stdout_extra)
     if stderr_log_func is not None:
-        line_out = left_over_stderr.decode(encoding='utf-8', errors='ignore').replace('\r', '')
+        line_out = left_over_stderr.decode(encoding='utf-8', errors='ignore')
         if len(line_out):
             stderr_log_func("%s", line_out, extra=stderr_extra)
 
