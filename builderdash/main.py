@@ -485,9 +485,7 @@ def kubevirt_instance(myBuild):
                 resources:
                   requests:
                     storage: {data_volume_pvc_storage_capacity}
-              source:
-                http:
-                  url: {data_volume_source_http_url}''')
+              source: {data_volume_source}''')
 
     with open(str(myBuild.pubkeypath), 'r') as f:
         kubevirt_public_key_openssh = f.read()
@@ -505,7 +503,7 @@ def kubevirt_instance(myBuild):
          'data_volume_name': 'root-data-volume-' + myBuild.instancename,
          'data_volume_pvc_access_mode': 'ReadWriteOnce',
          'data_volume_pvc_storage_capacity': disksize,
-         'data_volume_source_http_url': myBuild.sourceimage,
+         'data_volume_source': myBuild.sourceimage,
          'plain_text_passwd': myBuild.kubevirt_plain_text_passwd
         }
     rendered = kv_inst_tmpl.format(**d)
