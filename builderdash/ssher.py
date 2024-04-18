@@ -338,6 +338,9 @@ class SSHConnection:
         if dst == '.':
             dst = os.path.basename(src)
             logging.debug('dst has been automatically changed to basename(src), which is: %s', dst)
+        if dst.endswith(os.path.sep):
+            dst += os.path.basename(src)
+            logging.debug('dst has been automatically changed to %s', dst)
         try:
             sftp_attrs = self.target_sftp.put(src, dst)
         except Exception as e:
@@ -357,6 +360,9 @@ class SSHConnection:
         if dst == '.':
             dst = os.path.basename(src)
             logging.debug('dst has been automatically changed to basename(src), which is: %s', dst)
+        if dst.endswith(os.path.sep):
+            dst += os.path.basename(src)
+            logging.debug('dst has been automatically changed to %s', dst)
         try:
             self.target_sftp.get(src, dst)
         except Exception as e:
