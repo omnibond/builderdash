@@ -418,7 +418,9 @@ def googleInstance(myBuild):
     myBuild.instanceId = None
     return(myBuild)
 
-def kubevirt_instance(myBuild):
+
+def kubevirt_instance(myBuild, check_ready_limit=60, check_ready_delay=10.0):
+    myBuild.instanceId = None  # FIXME What should we use for the instanceId with kubevirt?
     # log source image
     print("Source image is " + str(myBuild.sourceimage))
     get_instance_name(myBuild, myBuild.sourceimage)
@@ -505,7 +507,7 @@ def kubevirt_instance(myBuild):
          'data_volume_pvc_storage_capacity': disksize,
          'data_volume_source': myBuild.sourceimage,
          'plain_text_passwd': myBuild.kubevirt_plain_text_passwd
-        }
+         }
     rendered = kv_inst_tmpl.format(**d)
     # TODO use unique file name below to support multiple concurrent kubevirt builds
     with open('/tmp/builderdash-kubevirt-instance-manifest.yaml', 'w') as wf:
@@ -523,39 +525,56 @@ def kubevirt_instance(myBuild):
     try:
         manifest_output = subprocess.check_output(['kubectl', 'apply', '-f', '-'], universal_newlines=True,
                                                   input=rendered).strip()
-    except subprocess.CalledProcessError:
-        manifest_output = None
-    logging.info('Output from applying manifest is %s', manifest_output)
+    except subprocess.CalledProcessError as e:
+        logging.error('kubectl apply failed: %s', e)
+        sys.exit(1)
+    else:
+        logging.info('kubectl apply succeeded')
+        logging.info('kubectl apply manifest output is: %s', manifest_output)
 
     instance_ready = False
-    counter = 0
-    while not instance_ready and counter < 60:
+    for i in range(check_ready_limit):
         try:
-            vm_output = subprocess.check_output(['kubectl', 'get', 'vm', myBuild.instancename, '-o', 'json']).strip()
-        except subprocess.CalledProcessError:
-            vm_output = None
-            break
-        # TODO add try for loading json
-        vm_data = json.loads(vm_output)
-        #logging.info('VM output is %s', yaml.dump(vm_data))
+            get_vm_output = subprocess.check_output(
+                ['kubectl', 'get', 'vm', '-o', 'json', myBuild.instancename]).strip()
+        except subprocess.CalledProcessError as e:
+            logging.error('kubectl get vm failed: %s', e)
+            sys.exit(1)
+        try:
+            vm_data = json.loads(get_vm_output)
+        except Exception as e:
+            logging.error('failed to load kubectl get vm output: %s', e)
+            sys.exit(1)
         if vm_data.get('status') and vm_data.get('status').get('ready'):
-            logging.info('kubevirt VM is READY: %s', myBuild.instancename)
+            logging.info('kubevirt VM status is ready for instance: %s', myBuild.instancename)
             instance_ready = True
+            break
         else:
-            logging.info('kubevirt VM is NOT READY. printableStatus: %s', vm_data.get('status').get('printableStatus'))
-            #logging.info("vm_data['status'] = \n%s", yaml.dump(vm_data['status']))
-            counter += 1
-            time.sleep(10)
-    # Gather remote ip of pod (with kubevirt instance inside)
+            logging.info('kubevirt VM status is NOT READY. printableStatus: %s',
+                         vm_data.get('status').get('printableStatus'))
+            time.sleep(check_ready_delay)
+    if not instance_ready:
+        logging.error('error instance_ready=False after reaching check_ready_limit: %d', check_ready_limit)
+        sys.exit(1)
+        # Gather ip address of the k8s pod with the kubevirt VM instance within it
     try:
-        vmi_output = subprocess.check_output(['kubectl', 'get', 'vmi', myBuild.instancename, '-o', 'json']).strip()
-    except subprocess.CalledProcessError:
-        vmi_output = None
-    # TODO add try for loading json
-    vmi_data = json.loads(vmi_output)
-    remoteIp = vmi_data['status']['interfaces'][0]['ipAddress']
-    myBuild.remoteIp = remoteIp
-    myBuild.instanceId = None
+        get_vmi_output = subprocess.check_output(
+            ['kubectl', 'get', 'vmi', '-o', 'json', myBuild.instancename]).strip()
+    except subprocess.CalledProcessError as e:
+        logging.error('kubectl get vmi failed: %S', e)
+        sys.exit(1)
+    try:
+        vmi_data = json.loads(get_vmi_output)
+    except Exception as e:
+        logging.error('failed to load kubectl get vmi output: %s', e)
+        sys.exit(1)
+    try:
+        instance_ip = vmi_data['status']['interfaces'][0]['ipAddress']
+    except Exception as e:
+        logging.error('failed to extract ipAddress from vmi_data: %s', e)
+        sys.exit(1)
+    else:
+        myBuild.remoteIp = instance_ip
     return myBuild
 
 def dispatchOption(option, args, ssh, myBuild):
@@ -676,18 +695,18 @@ def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
         ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
                             target_timeout=timeout, target_attempt_limit=attempt_limit, target_retry_delay=retry_delay,
-                            target_missing_host_key_policy=paramiko.WarningPolicy(),
+                            target_missing_host_key_policy=paramiko.AutoAddPolicy(),
                             proxy_hostname=myBuild.proxy_external_ip_address, proxy_port=myBuild.proxy_ssh_port,
                             proxy_username=myBuild.proxy_ssh_user,
                             proxy_key_filename=myBuild.proxy_priv_ssh_key_path,
                             proxy_timeout=timeout, proxy_attempt_limit=attempt_limit, proxy_retry_delay=retry_delay,
-                            proxy_missing_host_key_policy=paramiko.WarningPolicy(),
+                            proxy_missing_host_key_policy=paramiko.AutoAddPolicy(),
                             proxy_channel_alt_src_hostname=myBuild.proxy_internal_ip_address)
     else:
         ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
                             target_timeout=timeout, target_attempt_limit=attempt_limit,
-                            target_missing_host_key_policy=paramiko.WarningPolicy())
+                            target_missing_host_key_policy=paramiko.AutoAddPolicy())
     try:
         ssh.connect()
     except Exception as e:

@@ -160,7 +160,8 @@ class SSHConnection:
 
         # Create a local var for establishing the client connection
         proxy_client = paramiko.SSHClient()
-        proxy_client.load_system_host_keys()
+        #TODO
+        # proxy_client.load_system_host_keys()
         proxy_client.set_missing_host_key_policy(self.proxy_missing_host_key_policy)
 
         logging.info('attempting ssh connection via ssh proxy: %s', {
@@ -244,7 +245,8 @@ class SSHConnection:
 
         # Create a local var for establishing the client connection
         target_client = paramiko.SSHClient()
-        target_client.load_system_host_keys()
+        #TODO
+        # target_client.load_system_host_keys()
         target_client.set_missing_host_key_policy(self.target_missing_host_key_policy)
 
         logging.info('attempting ssh connection to target: %s', {
