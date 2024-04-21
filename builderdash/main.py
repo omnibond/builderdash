@@ -270,10 +270,7 @@ def awsInstance(myBuild):
     time.sleep(7)
     keyexists = False
     while keyexists == False:
-        try:
-            description = client.describe_instances(InstanceIds = [myBuild.instanceId])
-        except:
-            pass
+        description = client.describe_instances(InstanceIds = [myBuild.instanceId])
         for i in description:
             if i == 'Reservations':
                 for u in range(len(description[i])):
