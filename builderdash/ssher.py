@@ -5,9 +5,60 @@ import time
 
 import paramiko
 
+logger = logging.getLogger(__name__)
 
-def ssh_run_cmd(ssh_client, command, timeout=1.0, get_pty=True, stdout_log_func=logging.info,
-                stderr_log_func=logging.error, ret_stdout=True, ret_stderr=True, stdout_extra=None, stderr_extra=None):
+
+def load_proxy_conf_file(proxy_yaml_conf_file):
+    from builderdash.main import safe_load_yaml_file
+    # 1-to-1 match with proxy-related params of builderdash.ssher constructor
+    valid_keys = ['proxy_hostname',
+                  'proxy_port',
+                  'proxy_username',
+                  'proxy_password',
+                  'proxy_key_filename',
+                  'proxy_passphrase',
+                  'proxy_timeout',
+                  'proxy_attempt_limit',
+                  'proxy_retry_delay',
+                  'proxy_missing_host_key_policy',
+                  'proxy_channel_alt_src_hostname']
+    try:
+        conf = safe_load_yaml_file(proxy_yaml_conf_file)
+    except Exception:
+        logger.error(f"safe_load_yaml_file({proxy_yaml_conf_file}) failed")
+        return None
+
+    for k, v in conf.items():
+        if k not in valid_keys:
+            logger.error(f"invalid proxy config key: '{k}', check proxy_conf_file: {proxy_yaml_conf_file}")
+            return None
+
+    pconf = {}
+    for k in valid_keys:
+        v = conf.get(k)
+        if k == 'proxy_hostname' and v is None:
+            logger.error(f"proxy_hostname key missing, check proxy_conf_file")
+            return None
+        elif k == 'proxy_port' and v is None:
+            pconf[k] = 22
+        elif k == 'proxy_missing_host_key_policy':
+            # convert proxy_missing_host_key_policy string to actual paramiko policy or bail if not found / valid
+            missing_host_key_policy = None
+            if v == 'reject':
+                missing_host_key_policy = paramiko.RejectPolicy
+            elif v == 'warning':
+                missing_host_key_policy = paramiko.WarningPolicy
+            elif v == 'autoadd':
+                missing_host_key_policy = paramiko.AutoAddPolicy
+            pconf[k] = missing_host_key_policy
+        else:
+            # set any remaining vals to be their conf file val or set to None (if key missing in conf file)
+            pconf[k] = v
+    return pconf
+
+
+def ssh_run_cmd(ssh_client, command, timeout=1.0, get_pty=True, stdout_log_func=logger.info,
+                stderr_log_func=logger.error, ret_stdout=True, ret_stderr=True, stdout_extra=None, stderr_extra=None):
     # Adapted from: https://stackoverflow.com/a/32758464
     stdin, stdout, stderr = ssh_client.exec_command(command=command, get_pty=get_pty)
 
@@ -101,7 +152,7 @@ class SSHConnection:
                  proxy_hostname=None, proxy_port=22, proxy_username=None, proxy_password=None,
                  proxy_key_filename=None, proxy_passphrase=None, proxy_timeout=None, proxy_attempt_limit=None,
                  proxy_retry_delay=None, proxy_missing_host_key_policy=None, proxy_channel_alt_src_hostname=None):
-        logging.debug('called')
+        logger.debug('called')
         self.target_hostname = target_hostname
         self.target_port = int(target_port)
         self.target_username = target_username
@@ -137,7 +188,7 @@ class SSHConnection:
 
     # Attempts to establish a connection to a target host, potentially via a ssh proxy host.
     def connect(self):
-        logging.debug('called')
+        logger.debug('called')
         if self.proxy_hostname is not None:
             self.__connect_proxy()
             self.__proxy_open_channel_to_target()
@@ -146,14 +197,14 @@ class SSHConnection:
             try:
                 target_sftp = self.target_client.open_sftp()
             except Exception as e:
-                logging.error('target_client.open_sftp failed with exception %s', e)
+                logger.error('target_client.open_sftp failed with exception %s', e)
                 raise e
             else:
-                logging.info('target_client.open_sftp succeeded')
+                logger.info('target_client.open_sftp succeeded')
                 self.target_sftp = target_sftp
 
     def __connect_proxy(self):
-        logging.debug('called')
+        logger.debug('called')
 
         if self.proxy_client is not None:
             return
@@ -164,7 +215,7 @@ class SSHConnection:
         # proxy_client.load_system_host_keys()
         proxy_client.set_missing_host_key_policy(self.proxy_missing_host_key_policy)
 
-        logging.info('attempting ssh connection via ssh proxy: %s', {
+        logger.info('attempting ssh connection via ssh proxy: %s', {
             'proxy_hostname': self.proxy_hostname,
             'proxy_port': self.proxy_port,
             'proxy_username': self.proxy_username,
@@ -178,26 +229,26 @@ class SSHConnection:
         })
 
         for i in range(self.proxy_attempt_limit):
-            logging.debug('connect attempt %d of %d', i+1, self.proxy_attempt_limit)
+            logger.debug('connect attempt %d of %d', i+1, self.proxy_attempt_limit)
             try:
                 proxy_client.connect(hostname=self.proxy_hostname, port=self.proxy_port, username=self.proxy_username,
                                      password=self.proxy_password, key_filename=self.proxy_key_filename,
                                      passphrase=self.proxy_passphrase, timeout=self.proxy_timeout)
             except Exception as e:
-                logging.info('proxy_client.connect raised exception', e)
+                logger.info('proxy_client.connect raised exception', e)
                 if (i + 1) < self.proxy_attempt_limit:
-                    logging.info('trying again after %f seconds', self.proxy_retry_delay)
+                    logger.info('trying again after %f seconds', self.proxy_retry_delay)
                     time.sleep(self.proxy_retry_delay)
                 else:
-                    logging.info('__connect_proxy exceeded proxy_attempt_limit')
+                    logger.info('__connect_proxy exceeded proxy_attempt_limit')
                     raise e
             else:
-                logging.info('proxy_client.connect succeeded')
+                logger.info('proxy_client.connect succeeded')
                 self.proxy_client = proxy_client
                 break
 
     def __proxy_open_channel_to_target(self):
-        logging.debug('called')
+        logger.debug('called')
 
         if self.proxy_to_target_channel is not None:
             return
@@ -213,32 +264,32 @@ class SSHConnection:
         proxy_addr = (proxy_addr_hostname, self.proxy_port)
         target_addr = (self.target_hostname, self.target_port)
 
-        logging.info('opening channel to target via proxy: %s', {
+        logger.info('opening channel to target via proxy: %s', {
             'proxy_addr': proxy_addr,
             'target_addr': target_addr
         })
 
         # Note: reusing the target_attempt_limit here since this is technically a connection to target (via proxy)
         for i in range(self.target_attempt_limit):
-            logging.info('open_channel attempt %d of %d', i+1, self.target_attempt_limit)
+            logger.info('open_channel attempt %d of %d', i+1, self.target_attempt_limit)
             try:
                 proxy_to_target_channel = proxy_transport.open_channel('direct-tcpip', target_addr, proxy_addr,
                                                                        timeout=self.target_timeout)
             except Exception as e:
-                logging.info('proxy_transport.open_channel raised exception: %s', e)
+                logger.info('proxy_transport.open_channel raised exception: %s', e)
                 if (i + 1) < self.target_attempt_limit:
-                    logging.info('trying again after %f seconds', self.target_retry_delay)
+                    logger.info('trying again after %f seconds', self.target_retry_delay)
                     time.sleep(self.target_retry_delay)
                 else:
-                    logging.info('__proxy_open_channel_to_target exceeded target_attempt_limit')
+                    logger.info('__proxy_open_channel_to_target exceeded target_attempt_limit')
                     raise e
             else:
-                logging.info('proxy_transport.open_channel succeeded')
+                logger.info('proxy_transport.open_channel succeeded')
                 self.proxy_to_target_channel = proxy_to_target_channel
                 break
 
     def __connect_target(self):
-        logging.debug('called')
+        logger.debug('called')
 
         if self.target_client is not None:
             return
@@ -249,7 +300,7 @@ class SSHConnection:
         # target_client.load_system_host_keys()
         target_client.set_missing_host_key_policy(self.target_missing_host_key_policy)
 
-        logging.info('attempting ssh connection to target: %s', {
+        logger.info('attempting ssh connection to target: %s', {
             'target_hostname': self.target_hostname,
             'target_port': self.target_port,
             'target_username': self.target_username,
@@ -262,7 +313,7 @@ class SSHConnection:
         })
 
         for i in range(self.target_attempt_limit):
-            logging.info('connect attempt %d of %d', i + 1, self.target_attempt_limit)
+            logger.info('connect attempt %d of %d', i + 1, self.target_attempt_limit)
             try:
                 target_client.connect(hostname=self.target_hostname, port=self.target_port,
                                       username=self.target_username, password=self.target_password,
@@ -270,20 +321,20 @@ class SSHConnection:
                                       passphrase=self.target_passphrase, timeout=self.target_timeout,
                                       sock=self.proxy_to_target_channel)
             except Exception as e:
-                logging.info('target_client.connect raised exception', e)
+                logger.info('target_client.connect raised exception', e)
                 if (i + 1) < self.target_attempt_limit:
-                    logging.info('trying again after %f seconds', self.target_retry_delay)
+                    logger.info('trying again after %f seconds', self.target_retry_delay)
                     time.sleep(self.target_retry_delay)
                 else:
-                    logging.info('__connect_target exceeded target_attempt_limit')
+                    logger.info('__connect_target exceeded target_attempt_limit')
                     raise e
             else:
-                logging.info('target_client.connect succeeded')
+                logger.info('target_client.connect succeeded')
                 self.target_client = target_client
                 break
 
     def disconnect(self):
-        logging.debug('called')
+        logger.debug('called')
         if self.target_sftp is not None:
             self.target_sftp.close()
             self.target_sftp = None
@@ -299,15 +350,15 @@ class SSHConnection:
         if self.proxy_client is not None:
             self.proxy_client.close()
             self.proxy_client = None
-        logging.info('all connections under this SSHConnection object closed: %s', self)
+        logger.info('all connections under this SSHConnection object closed: %s', self)
 
     def reconnect(self):
-        logging.debug('called')
+        logger.debug('called')
         self.disconnect()
         self.connect()
 
     def is_alive(self):
-        logging.debug('called')
+        logger.debug('called')
         if self.target_client is None or self.target_sftp is None:
             return False
 
@@ -326,7 +377,7 @@ class SSHConnection:
         except IOError as e:
             return False
         else:
-            logging.debug('self.target_sftp.normalize(path=\'.\') returned: %s', normalized_path)
+            logger.debug('self.target_sftp.normalize(path=\'.\') returned: %s', normalized_path)
 
         return True
 
@@ -336,20 +387,20 @@ class SSHConnection:
         :param src: str, required
         :param dst: str, required
         """
-        logging.debug("called, local src: '%s' --> target dst: '%s'", src, dst)
+        logger.debug("called, local src: '%s' --> target dst: '%s'", src, dst)
         if dst == '.':
             dst = os.path.basename(src)
-            logging.debug('dst has been automatically changed to basename(src), which is: %s', dst)
+            logger.debug('dst has been automatically changed to basename(src), which is: %s', dst)
         if dst.endswith(os.path.sep):
             dst += os.path.basename(src)
-            logging.debug('dst has been automatically changed to %s', dst)
+            logger.debug('dst has been automatically changed to %s', dst)
         try:
             sftp_attrs = self.target_sftp.put(src, dst)
         except Exception as e:
-            logging.error('file_upload failed: %s', e)
+            logger.error('file_upload failed: %s', e)
             raise e
         else:
-            logging.debug('file_upload succeeded, remote sftp attrs: %s', sftp_attrs)
+            logger.debug('file_upload succeeded, remote sftp attrs: %s', sftp_attrs)
             return sftp_attrs
 
     def file_download(self, src, dst='.'):
@@ -358,21 +409,21 @@ class SSHConnection:
         :param src: str, required
         :param dst: str, required
         """
-        logging.debug("called, target src: '%s' --> local dst: '%s'", src, dst)
+        logger.debug("called, target src: '%s' --> local dst: '%s'", src, dst)
         if dst == '.':
             dst = os.path.basename(src)
-            logging.debug('dst has been automatically changed to basename(src), which is: %s', dst)
+            logger.debug('dst has been automatically changed to basename(src), which is: %s', dst)
         if dst.endswith(os.path.sep):
             dst += os.path.basename(src)
-            logging.debug('dst has been automatically changed to %s', dst)
+            logger.debug('dst has been automatically changed to %s', dst)
         try:
             self.target_sftp.get(src, dst)
         except Exception as e:
-            logging.error('file_download failed: %s', e)
+            logger.error('file_download failed: %s', e)
             raise e
         else:
             dst_stat_attrs = os.stat(dst)
-            logging.debug('file_download succeeded, dst_stat_attrs: %s', dst_stat_attrs)
+            logger.debug('file_download succeeded, dst_stat_attrs: %s', dst_stat_attrs)
             return dst_stat_attrs
 
     def get_target_client(self):
@@ -382,7 +433,7 @@ class SSHConnection:
         return self.proxy_client
 
     # Run command using self.target_client as the default client
-    def run_command(self, command, get_pty=True, stdout_log_func=logging.info, stderr_log_func=logging.error,
+    def run_command(self, command, get_pty=True, stdout_log_func=logger.info, stderr_log_func=logger.error,
                     ret_stdout=True, ret_stderr=True, stdout_extra=None, stderr_extra=None, ssh_client=None):
         client = self.target_client if ssh_client is None else ssh_client
         return ssh_run_cmd(client, command, get_pty=get_pty, stdout_log_func=stdout_log_func,

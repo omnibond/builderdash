@@ -24,7 +24,7 @@ import googleapiclient.discovery
 import paramiko
 import yaml
 
-from builderdash.ssher import SSHConnection
+from builderdash.ssher import SSHConnection, load_proxy_conf_file
 
 
 class Build():
@@ -50,6 +50,24 @@ class Build():
             self.tagList += self.customtags
 
         logging.info("List of Tags is %s" % self.tagList)
+
+
+def safe_load_yaml_file(yaml_file):
+    try:
+        f = open(yaml_file)
+    except Exception as e:
+        print(f"open({yaml_file}) raised exception:", e, file=sys.stderr)
+        raise e
+    try:
+        loaded_yaml = yaml.safe_load(f)
+    except Exception as e:
+        print(f"yaml.safe_load raised exception:", e, file=sys.stderr)
+        f.close()
+        raise e
+    else:
+        f.close()
+        return loaded_yaml
+
 
 #########Set Environment Variables that CC Needs#########
 def setCloudyClusterEnvVars(ssh, myBuild):
@@ -92,11 +110,18 @@ def processInitSection(configSection, myBuild):
         return None
     else:
         logging.debug("Running in remote mode")
-        if hasattr(myBuild, 'sshkey'):
-            pass
-        else:
-            logging.info("no sshkey please configure one")
+        if not hasattr(myBuild, 'sshkey'):
+            logging.error("no sshkey please configure one")
             sys.exit(1)
+        if hasattr(myBuild, 'proxy_conf_path'):
+            logging.info(f'proxy_conf_path: {myBuild.proxy_conf_path}')
+            proxy_conf = load_proxy_conf_file(myBuild.proxy_conf_path)
+            if proxy_conf is None:
+                logging.error(f'proxy_conf_path detected but loaded proxy_conf is None')
+                sys.exit(1)
+            else:
+                setattr(myBuild, 'proxy_conf', proxy_conf)
+                logging.info(f'myBuild.proxy_conf: {myBuild.proxy_conf}')
         logging.info("instance type is %s", str(myBuild.instancetype))
         response = launchInstance(myBuild)
         myBuild = response
@@ -688,17 +713,20 @@ def processSection(configSection, ssh, myBuild):
 def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
     logging.info('ssh_connect called')
     # TODO clean up variable names below
-    if hasattr(myBuild, 'proxy_external_ip_address') and myBuild.proxy_external_ip_address is not None:
+    if hasattr(myBuild, 'proxy_conf'):
         ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
                             target_timeout=timeout, target_attempt_limit=attempt_limit, target_retry_delay=retry_delay,
                             target_missing_host_key_policy=paramiko.AutoAddPolicy(),
-                            proxy_hostname=myBuild.proxy_external_ip_address, proxy_port=myBuild.proxy_ssh_port,
-                            proxy_username=myBuild.proxy_ssh_user,
-                            proxy_key_filename=myBuild.proxy_priv_ssh_key_path,
-                            proxy_timeout=timeout, proxy_attempt_limit=attempt_limit, proxy_retry_delay=retry_delay,
-                            proxy_missing_host_key_policy=paramiko.AutoAddPolicy(),
-                            proxy_channel_alt_src_hostname=myBuild.proxy_internal_ip_address)
+                            proxy_hostname=myBuild.proxy_conf['proxy_hostname'],
+                            proxy_port=myBuild.proxy_conf['proxy_port'],
+                            proxy_username=myBuild.proxy_conf['proxy_username'],
+                            proxy_key_filename=myBuild.proxy_conf['proxy_key_filename'],
+                            proxy_timeout=myBuild.proxy_conf['proxy_timeout'],
+                            proxy_attempt_limit=myBuild.proxy_conf['proxy_attempt_limit'],
+                            proxy_retry_delay=myBuild.proxy_conf['proxy_retry_delay'],
+                            proxy_missing_host_key_policy=myBuild.proxy_conf['proxy_missing_host_key_policy'],
+                            proxy_channel_alt_src_hostname=myBuild.proxy_conf['proxy_channel_alt_src_hostname'])
     else:
         ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
