@@ -654,7 +654,7 @@ def dispatchOption(option, args, ssh, myBuild):
     elif option == "envvar":
         envVariables(args, ssh, myBuild)
     elif option == "tar":
-        compressOrExtract(args, ssh, myBuild)
+        createOrExtract(args, ssh, myBuild)
     elif option == "cloudyvars":
         setCloudyClusterEnvVars(ssh, myBuild)
     else:
@@ -915,32 +915,35 @@ def testtouch(touchy, ssh, myBuild):
         runCommand(ssh, commandString, myBuild)
 
 #########Tar Compress or Tar Extract Files#######################################
-def compressOrExtract(tarlist, ssh, myBuild):
+def createOrExtract(tarlist, ssh, myBuild):
     for key in tarlist:
+        tarName = key
         logging.info(key)
         local = tarlist[key][0]
         action = tarlist[key][1]
-        location = tarlist[key][2]
-        tarName = key
-        if local == False or local == 'False':
-            if action == 'compress':
-                commandString = 'sudo tar -zcvf '+str(tarName)+' '+str(location)
+        change_dir = tarlist[key][2]
+        if local is False or local == 'False':
+            if action == 'create':
+                paths = ' '.join(tarlist[key][3:])
+                commandString = f'sudo tar -C {change_dir} -zcvf {tarName} {paths}'
                 runCommand(ssh, commandString, myBuild, local=False)
             elif action == 'extract':
-                commandString = 'sudo tar -zxvf '+str(tarName)+' -C '+str(location)
+                commandString = f'sudo tar -C {change_dir} -zxvf {tarName}'
                 runCommand(ssh, commandString, myBuild, local=False)
             else:
-                logging.info("No action was specified in cfg file.  Could not compress or extract tar.")
+                logging.info('No action was specified in cfg file.  Could not compress or extract tar.')
                 
-        elif local == True or local == 'True':
-            if action == 'compress':
-                commandString = 'tar -zcvf '+str(tarName)+' '+str(location)
+        elif local is True or local == 'True':
+            if action == 'create':
+                paths = ' '.join(tarlist[key][3:])
+                # Added --no-xattrs for local create since BSD tar on macOS adds xattrs and Linux extract complains
+                commandString = f'tar --no-xattrs -C {change_dir} -zcvf {tarName} {paths}'
                 runCommand(ssh, commandString, myBuild, local=True)
             elif action == 'extract':
-                commandString = 'tar -zxvf '+str(tarName)+' -C '+str(location)
+                commandString = f'tar -C {change_dir} -zxvf {tarName} '
                 runCommand(ssh, commandString, myBuild, local=True)
             else:
-                logging.info("No action was specified in cfg file.  Could not compress or extract tar.")
+                logging.info('No action was specified in cfg file.  Could not compress or extract tar.')
 
 ##########Get Distribution of Local Operating System###############
 def get_distribution():
