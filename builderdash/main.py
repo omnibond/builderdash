@@ -504,6 +504,7 @@ def kubevirt_instance(myBuild, check_ready_limit=60, check_ready_delay=10.0):
               name: {data_volume_name}
             spec:
               pvc:
+                {data_volume_pvc_storage_class}
                 accessModes:
                 - {data_volume_pvc_access_mode}
                 resources:
@@ -525,6 +526,9 @@ def kubevirt_instance(myBuild, check_ready_limit=60, check_ready_delay=10.0):
          'ssh_user': str(myBuild.sshkeyuser),
          'public_key_openssh': kubevirt_public_key_openssh,
          'data_volume_name': 'root-data-volume-' + myBuild.instancename,
+         'data_volume_pvc_storage_class': ('' if (myBuild.kubevirt_storage_class_name is None or
+                                                  myBuild.kubevirt_storage_class_name == 'None') else
+                                           f"storageClassName: {myBuild.kubevirt_storage_class_name}"),
          'data_volume_pvc_access_mode': 'ReadWriteOnce',
          'data_volume_pvc_storage_capacity': disksize,
          'data_volume_source': myBuild.sourceimage,
