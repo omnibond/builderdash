@@ -15,8 +15,8 @@ setuptools.setup(
     install_requires=[
         'botocore',
         'google-api-python-client',
-        'paramiko',
-        'requests',
+        'kubernetes',                  # Requires Python >=3.6
+        'paramiko',                    # Requires Python >=3.6
         'pyyaml'
     ],
     entry_points={
