@@ -548,7 +548,7 @@ def googleInstance(myBuild):
     myBuild.instanceId = None
 
 
-def kubevirt_instance(my_build, timeout=600, interval=10):
+def kubevirt_instance(my_build, timeout=3600, interval=10):
     logging.info('kubevirt_instance called')
     logging.info('my_build.env_provider is: %s', my_build.env_provider)
 
