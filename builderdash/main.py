@@ -3,6 +3,7 @@
 #
 #Terms of Service are located at:
 #http://www.cloudycluster.com/termsofservice
+from __future__ import annotations
 import argparse
 import ast
 import configparser
@@ -16,33 +17,83 @@ import re
 import subprocess
 import sys
 import time
-from textwrap import dedent
+from enum import Enum, unique
+from typing import Any, List
 
 import botocore
 import botocore.session
 import googleapiclient.discovery
 import paramiko
 import yaml
+import kubernetes
 
+from builderdash.kubevirt_operations import (
+    create_vm_and_wait_for_ip,
+    delete_vm,
+    generate_rendered_vm_yaml_manifest,
+    stop_vmi,
+)
 from builderdash.ssher import SSHConnection, load_proxy_conf_file
 
 
-class Build():
-    def setup(self, configSection):
-        for key in configSection:
+@unique
+class EnvProvider(str, Enum):
+    AWS = 'aws'
+    AZURE = 'azure'
+    GCP = 'gcp'
+    K8S_CONTAINER = 'container'
+    K8S_VM = 'kubevirt'
+
+    @staticmethod
+    def is_valid_provider(provider):
+        return provider in EnvProvider.valid_providers()
+
+    @staticmethod
+    def providers():
+        return [e.value for e in EnvProvider]
+
+    @staticmethod
+    def valid_providers() -> List[EnvProvider]:
+        return [
+            EnvProvider.AWS,
+            # TODO: EnvProvider.AZURE,
+            EnvProvider.GCP,
+            # TODO: EnvProvider.K8S_CONTAINER,
+            EnvProvider.K8S_VM,
+        ]
+
+
+class Build:
+    tagList = None
+    env_provider = None
+
+    def setup(self, config_section):
+        config_key = None
+        for key in config_section:
             config_key = key
- 
+            logging.info(f'config_key: {config_key}')
+        # TODO What is the purpose of the loop above? Is it to determine the last key in the config_section?
+
         # First parse and set all attributes from this section.
-        for option in configSection[config_key]:
-            for key in option:
-                name = key
-            setattr(self, name, option[name])
+        if config_key:
+            name = None
+            for option in config_section[config_key]:
+                for key in option:
+                    name = key
+                    logging.info(f"option = {option}\tname = {name}")
+                # TODO What is the purpose of the inner loop above? Is it to determine the last key in the option?
+                logging.info(f"setting attribute on instance of class Build: {name}: {option[name]}")
+                if name:
+                    setattr(self, name, option[name])
 
         # Now set tagList.
         try:
-            self.tagList = [self.buildtype.lower(), self.ostype.lower(), self.cloudservice.lower()]
-        except:
-            logging.exception("tagList element not found!")
+            build_type = getattr(self, 'buildtype')
+            os_type = getattr(self, 'ostype')
+            cloud_service = getattr(self, 'cloudservice')
+            self.tagList = [tag.lower() for tag in [build_type, os_type, cloud_service]]
+        except Exception as e:
+            logging.exception(f"tagList element not found! Exception: {e}")
             logging.info("Check input .yaml for buildtype, ostype, and cloudservice.")
             logging.info("Exiting...")
             sys.exit(1)
@@ -51,9 +102,61 @@ class Build():
 
         logging.info("List of Tags is %s" % self.tagList)
 
+        env_provider_str = getattr(self, 'cloudservice').lower()
+        delattr(self, 'cloudservice')
+        if not EnvProvider.is_valid_provider(env_provider_str):
+            logging.error(f"cloudservice in input .yaml is {env_provider_str} but must be one of: "
+                          f"{EnvProvider.valid_providers()}")
+            sys.exit(1)
+
+        self.env_provider = EnvProvider(env_provider_str)
+        if self.env_provider == EnvProvider.K8S_VM or self.env_provider == EnvProvider.K8S_CONTAINER:
+            self.k8s_setup_client()
+
+    def k8s_setup_client(self):
+        config_file = getattr(self, 'k8s_kubeconfig_path', None)
+        if config_file is not None:
+            config_file = os.path.expanduser(config_file)
+
+        kubernetes.config.load_kube_config(
+            config_file=config_file,
+            context=getattr(self, 'k8s_kubeconfig_context', None),
+            persist_config=False
+        )
+
+        contexts, current_context = kubernetes.config.list_kube_config_contexts()
+
+        # Extract the namespace from the current context
+        current_namespace = current_context['context'].get('namespace', 'default')
+
+        # If namespace WAS NOT specified in build.config (or was null), use namespace from kubeconfig (or 'default')
+        if getattr(self, 'k8s_namespace', None) is None:
+            setattr(self, 'k8s_namespace', current_namespace)
+
+    def k8s_save_config(self, path, output_format='json'):
+        try:
+            d = {
+                'k8s_config': {
+                    'namespace': getattr(self, 'k8s_namespace'),
+                    'config_file': getattr(self, 'k8s_kubeconfig_path'),
+                    'context': getattr(self, 'k8s_kubeconfig_context'),
+                }
+            }
+            with open(os.path.expanduser(path), 'w') as fp:
+                if output_format == 'json':
+                    json.dump(d, fp, indent=4)
+                elif output_format == 'yaml':
+                    yaml.dump(d, fp, indent=4)
+                else:
+                    raise ValueError(f"k8s_save_config was provided invalid output_format: '{output_format}'."
+                                     "Must be 'json' or 'yaml'.")
+        except Exception as e:
+            logging.error(f"k8s_save_config raised exception: {e}")
+
 
 def safe_load_yaml_file(yaml_file):
     try:
+        yaml_file = os.path.expanduser(yaml_file)
         f = open(yaml_file)
     except Exception as e:
         print(f"open({yaml_file}) raised exception:", e, file=sys.stderr)
@@ -94,11 +197,18 @@ def setCloudyClusterEnvVars(ssh, myBuild):
     runCommand(ssh, commandString, myBuild)
     commandString = 'sudo sed -i \'$ aexport CC_AWS_SSH_USERNAME='+CC_AWS_SSH_USERNAME+'\' /etc/profile'
     runCommand(ssh, commandString, myBuild)
-    commandString = 'sudo sed -i \'$ aexport CLOUD='+str(myBuild.cloudservice)+'\' /etc/profile'
+    commandString = 'sudo sed -i \'$ aexport CLOUD='+str(myBuild.env_provider.value)+'\' /etc/profile'
     runCommand(ssh, commandString, myBuild)
     commandString = 'source /etc/profile'
     runCommand(ssh, commandString, myBuild)
     logging.info("end of cloudy vars")
+
+
+def write_operating_env_provider_file(ssh, my_build, output_file='/etc/eureka-operating-env-provider'):
+    logging.info(f"writing eureka operating env provider: '{my_build.env_provider.value}' to file: {output_file}")
+    command_string = f"echo '{my_build.env_provider.value}' | sudo tee \"{output_file}\""
+    runCommand(ssh, command_string, my_build)
+
 
 def processInitSection(configSection, myBuild):
     logging.info("Entered processInitSection")
@@ -123,8 +233,7 @@ def processInitSection(configSection, myBuild):
                 setattr(myBuild, 'proxy_conf', proxy_conf)
                 logging.info(f'myBuild.proxy_conf: {myBuild.proxy_conf}')
         logging.info("instance type is %s", str(myBuild.instancetype))
-        response = launchInstance(myBuild)
-        myBuild = response
+        launchInstance(myBuild)
         logging.info("remoteIp is %s", str(myBuild.remoteIp))
 
         # *******   loop / sleep until userapps
@@ -139,7 +248,7 @@ def processInitSection(configSection, myBuild):
             sys.exit(1)
 
         logging.info('osType inside process init is %s', str(myBuild.ostype))
-
+        write_operating_env_provider_file(ssh, myBuild)
         # TODO why are we installing wget here? Can this be cleaned up?
         run_cmd = 'sudo yum install wget -y'
         logging.info('calling exec_command on: %s', run_cmd)
@@ -154,19 +263,18 @@ def processInitSection(configSection, myBuild):
         return ssh
 
 def launchInstance(myBuild):
-    if myBuild.cloudservice == 'aws':
-        result = awsInstance(myBuild)
-    elif myBuild.cloudservice == 'gcp':
-        result = googleInstance(myBuild)
-    elif myBuild.cloudservice == 'kubevirt':
-        result = kubevirt_instance(myBuild)
+    if myBuild.env_provider == EnvProvider.AWS:
+        awsInstance(myBuild)
+    elif myBuild.env_provider == EnvProvider.GCP:
+        googleInstance(myBuild)
+    elif myBuild.env_provider == EnvProvider.K8S_VM:
+        kubevirt_instance(myBuild)
     else:
-        logging.info("No cloudservice was found in the cfg file. Please put one under the init section in your cfg file")
+        logging.error("build has invalid env_provider")
         sys.exit(1)
-    myBuild = result
-    return(myBuild)
 
-def get_instance_name(myBuild, sourcename):
+
+def generate_and_set_instance_name(myBuild, sourcename):
     if hasattr(myBuild, "instancename"):
         image_start = f"builderdash-{myBuild.instancename}-{myBuild.buildtype}"
     else:
@@ -220,7 +328,7 @@ def awsInstance(myBuild):
                 sys.exit(1)
         else:
             pass
-    myBuild = handleUserData(myBuild)
+    handleUserData(myBuild)
 
     if not hasattr(myBuild, "rootdev"):
         r = client.describe_images(ImageIds=[myBuild.sourceimage])
@@ -268,7 +376,7 @@ def awsInstance(myBuild):
             sourcename = response["Images"][0]["Name"]
         except:
             logging.error("could not describe source image")
-        get_instance_name(myBuild, sourcename)
+        generate_and_set_instance_name(myBuild, sourcename)
         logging.info("Spinning up the instance")
         iamstuff = {'Name': 'instance-admin'}
         blockDeviceStuff = [{'DeviceName': myBuild.rootdev, "Ebs": {"DeleteOnTermination": True, "VolumeSize": disksize, "VolumeType": "gp2"}}]
@@ -321,7 +429,7 @@ def awsInstance(myBuild):
             counter += 1
         logging.info('Remote IP is %s', str(myBuild.remoteIp))
         myBuild.projectName = 'None'
-        return(myBuild)                
+
 
 #######Google Launch is Next##########
 def googleInstance(myBuild):
@@ -356,7 +464,7 @@ def googleInstance(myBuild):
     # log source image
     print("Source image is " + str(myBuild.sourceimage))
 
-    get_instance_name(myBuild, myBuild.sourceimage)
+    generate_and_set_instance_name(myBuild, myBuild.sourceimage)
 
     if hasattr(myBuild, "disksize"):
         disksize = myBuild.disksize
@@ -438,170 +546,57 @@ def googleInstance(myBuild):
     remoteIp = result['items'][0]['networkInterfaces'][0]['accessConfigs'][0]['natIP']
     myBuild.remoteIp = remoteIp
     myBuild.instanceId = None
-    return(myBuild)
 
 
-def kubevirt_instance(myBuild, check_ready_limit=60, check_ready_delay=10.0):
-    myBuild.instanceId = None  # FIXME What should we use for the instanceId with kubevirt?
-    # log source image
-    print("Source image is " + str(myBuild.sourceimage))
-    get_instance_name(myBuild, myBuild.sourceimage)
-    if hasattr(myBuild, "disksize"):
-        disksize = myBuild.disksize
-    else:
-        disksize = "55"
-    kv_inst_tmpl = dedent('''\
-        apiVersion: kubevirt.io/v1
-        kind: VirtualMachine
-        metadata:
-          name: {name}
-          namespace: {namespace}
-          labels: {labels}
-        spec:
-          running: {instance_state}
-          instancetype:
-            kind: {instance_type_kind}
-            name: {instance_type_name}
-          template:
-            metadata:
-              labels: {labels}
-            spec:
-              domain:
-                devices:
-                  interfaces:
-                  - name: default
-                    masquerade: {{}}
-                    macAddress: {mac_address}
-                  disks:
-                  - name: {data_volume_disk_name}
-                    disk:
-                      bus: virtio
-                  - name: cloudinitdisk
-                    disk:
-                      bus: virtio
-              networks:
-              - name: default
-                pod: {{}}
-              volumes:
-              - name: cloudinitdisk
-                cloudInitNoCloud:
-                  userData: |
-                    #cloud-config
-                    users:
-                      - name: {ssh_user}
-                        groups: sudo
-                        shell: /bin/bash
-                        sudo: ALL=(ALL) NOPASSWD:ALL
-                        lock_passwd: false
-                        plain_text_passwd: {plain_text_passwd}
-                        ssh_authorized_keys:
-                          - {public_key_openssh}
-              - name: {data_volume_disk_name}
-                dataVolume:
-                  name: {data_volume_name}
-          dataVolumeTemplates:
-          - metadata:
-              name: {data_volume_name}
-            spec:
-              pvc:
-                {data_volume_pvc_storage_class}
-                accessModes:
-                - {data_volume_pvc_access_mode}
-                resources:
-                  requests:
-                    storage: {data_volume_pvc_storage_capacity}
-              source: {data_volume_source}''')
+def kubevirt_instance(my_build, timeout=600, interval=10):
+    logging.info('kubevirt_instance called')
+    logging.info('my_build.env_provider is: %s', my_build.env_provider)
 
-    with open(str(myBuild.pubkeypath), 'r') as f:
-        kubevirt_public_key_openssh = f.read()
+    k8s_save_config_format = 'yaml'
+    k8s_save_config_path = os.path.join(os.getcwd(), f'k8s_config.{k8s_save_config_format}')
+    logging.info(f"Saving k8s configuration to local file so it may be reused by env.py via provider data.")
+    logging.info(f"k8s_save_config_path: {k8s_save_config_path}")
+    my_build.k8s_save_config(k8s_save_config_path, k8s_save_config_format)
 
-    d = {'name': myBuild.instancename,
-         'namespace': myBuild.kubevirt_namespace,
-         'labels': {},
-         'instance_state': 'true',
-         'instance_type_kind': 'VirtualMachineInstancetype',
-         'instance_type_name': myBuild.instancetype,
-         'mac_address': 'ee:ee:ee:ee:ee:ee',
-         'data_volume_disk_name': 'data-volume-disk',
-         'ssh_user': str(myBuild.sshkeyuser),
-         'public_key_openssh': kubevirt_public_key_openssh,
-         'data_volume_name': 'root-data-volume-' + myBuild.instancename,
-         'data_volume_pvc_storage_class': ('' if (myBuild.kubevirt_storage_class_name is None or
-                                                  myBuild.kubevirt_storage_class_name == 'None') else
-                                           f"storageClassName: {myBuild.kubevirt_storage_class_name}"),
-         'data_volume_pvc_access_mode': 'ReadWriteOnce',
-         'data_volume_pvc_storage_capacity': disksize,
-         'data_volume_source': myBuild.sourceimage,
-         'plain_text_passwd': myBuild.kubevirt_plain_text_passwd
-         }
-    rendered = kv_inst_tmpl.format(**d)
-    # TODO use unique file name below to support multiple concurrent kubevirt builds
-    with open('/tmp/builderdash-kubevirt-instance-manifest.yaml', 'w') as wf:
-        wf.write(rendered)
-    logging.info('myBuild.cloudservice is: %s', myBuild.cloudservice)
-    logging.info('myBuild.instancename is: %s', myBuild.instancename)
-    logging.info('Applying generated kubevirt vm manifest for build instance.')
-    # ------------------------------------------------------------------------------------------------------------------
-    # TODO: enable support for customizing k8s kube config path and config context.
-    # Currently using:
-    #   - default kube config path:     ~/.kube/config
-    #   - default config context:       "default"
-    # Need add associated variables to myBuild and determine how to cause kubectl to use them
-    # ------------------------------------------------------------------------------------------------------------------
+    my_build.kubevirt_api = kubernetes.client.CustomObjectsApi()
+
+    logging.info(f"kubevirt_api is: {my_build.kubevirt_api}")
+    logging.info(f"Source image is:\n# BEGIN\n{json.dumps(my_build.sourceimage, indent=4)}\n# END")
+
+    generate_and_set_instance_name(my_build, my_build.sourceimage)
+
+    logging.info('my_build.instancename is: %s', my_build.instancename)
+
+    # TODO What should we use for the instanceId with kubevirt?
+    my_build.instanceId = None
+
+    rendered_manifest = generate_rendered_vm_yaml_manifest(my_build)
+
+    logging.info(f'Rendered kubevirt VM instance yaml manifest:\n# BEGIN\n{rendered_manifest}\n# END')
+
     try:
-        manifest_output = subprocess.check_output(['kubectl', 'apply', '-f', '-'], universal_newlines=True,
-                                                  input=rendered).strip()
-    except subprocess.CalledProcessError as e:
-        logging.error('kubectl apply failed: %s', e)
-        sys.exit(1)
-    else:
-        logging.info('kubectl apply succeeded')
-        logging.info('kubectl apply manifest output is: %s', manifest_output)
-
-    instance_ready = False
-    for i in range(check_ready_limit):
-        try:
-            get_vm_output = subprocess.check_output(
-                ['kubectl', 'get', 'vm', '-o', 'json', myBuild.instancename]).strip()
-        except subprocess.CalledProcessError as e:
-            logging.error('kubectl get vm failed: %s', e)
-            sys.exit(1)
-        try:
-            vm_data = json.loads(get_vm_output)
-        except Exception as e:
-            logging.error('failed to load kubectl get vm output: %s', e)
-            sys.exit(1)
-        if vm_data.get('status') and vm_data.get('status').get('ready'):
-            logging.info('kubevirt VM status is ready for instance: %s', myBuild.instancename)
-            instance_ready = True
-            break
-        else:
-            logging.info('kubevirt VM status is NOT READY. printableStatus: %s',
-                         vm_data.get('status').get('printableStatus'))
-            time.sleep(check_ready_delay)
-    if not instance_ready:
-        logging.error('error instance_ready=False after reaching check_ready_limit: %d', check_ready_limit)
-        sys.exit(1)
-        # Gather ip address of the k8s pod with the kubevirt VM instance within it
-    try:
-        get_vmi_output = subprocess.check_output(
-            ['kubectl', 'get', 'vmi', '-o', 'json', myBuild.instancename]).strip()
-    except subprocess.CalledProcessError as e:
-        logging.error('kubectl get vmi failed: %S', e)
-        sys.exit(1)
-    try:
-        vmi_data = json.loads(get_vmi_output)
+        vm_manifest = yaml.safe_load(rendered_manifest)
     except Exception as e:
-        logging.error('failed to load kubectl get vmi output: %s', e)
+        logging.error(f"failed to yaml.safe_load the VM rendered_manifest. Exception is {e}")
         sys.exit(1)
-    try:
-        instance_ip = vmi_data['status']['interfaces'][0]['ipAddress']
-    except Exception as e:
-        logging.error('failed to extract ipAddress from vmi_data: %s', e)
+
+    logging.info('Applying generated kubevirt VM manifest for build instance and waiting for its IP...')
+
+    ip_address = create_vm_and_wait_for_ip(
+        my_build.kubevirt_api,
+        my_build.k8s_namespace,
+        my_build.instancename,
+        vm_manifest,
+        timeout=timeout,
+        interval=interval
+    )
+    if ip_address is None:
+        logging.error(f"VM IP Address is None. Exiting.")
         sys.exit(1)
-    else:
-        myBuild.remoteIp = instance_ip
-    return myBuild
+
+    logging.info(f"VM IP Address: {ip_address}")
+    my_build.remoteIp = ip_address
+
 
 def dispatchOption(option, args, ssh, myBuild):
     logging.info("%s %s", option, args)
@@ -811,27 +806,28 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
     else:
         logging.info("Couldn't get a local status")
 
+
 ###########Stops the running instance##############################
 def stopInstance(myBuild):
     # TODO make stopInstance optional for debugging purposes.
     logging.info("stopping instance...")
-    if myBuild.cloudservice == 'aws':
+    if myBuild.env_provider == EnvProvider.AWS:
         session = botocore.session.get_session()
         client = session.create_client('ec2', region_name = str(myBuild.region))
         response = client.stop_instances(InstanceIds = [str(myBuild.instanceId)]) 
-    elif myBuild.cloudservice == 'gcp':
+    elif myBuild.env_provider == EnvProvider.GCP:
         compute = googleapiclient.discovery.build('compute', 'v1', cache_discovery=False)
         result = compute.instances().stop(project=myBuild.projectname, zone=myBuild.region, instance=str(myBuild.instancename)).execute()
-    elif myBuild.cloudservice == 'kubevirt':
+    elif myBuild.env_provider == EnvProvider.K8S_VM:
         try:
-            stop_vmi_output = subprocess.check_output(['kubectl', 'patch', 'virtualmachine', myBuild.instancename,
-                                                       '--type', 'merge', '-p', '{"spec":{"running":false}}']).strip()
-        except subprocess.CalledProcessError:
-            stop_vmi_output = None
+            stop_vmi(myBuild.kubevirt_api, myBuild.k8s_namespace, myBuild.instancename)
+        except Exception as e:
+            logging.error('failed to stop kubevirt vmi: %s', e)
     else:
-        logging.info("No cloudservice was found in the cfg file. Please put one under the init section in your cfg file")
+        logging.error("build has invalid env_provider")
         sys.exit(1)
     logging.info("instance stopped...")
+
 
 ############### Saves the Image depending on the Cloud Service Being Used.##########################
 def saveImage(slist, myBuild):
@@ -841,9 +837,9 @@ def saveImage(slist, myBuild):
         imageName = myBuild.instancename
     else:
         imageName = "%s-%s" % (imageName, random.SystemRandom().getrandbits(16))
-    if myBuild.cloudservice == 'azure':
+    if myBuild.env_provider == EnvProvider.AZURE:
         logging.info('This feature not supported')
-    elif myBuild.cloudservice == 'aws':
+    elif myBuild.env_provider == EnvProvider.AWS:
         session = botocore.session.get_session()
         client = session.create_client('ec2', region_name = str(myBuild.region))
         logging.info('Stopping instance')
@@ -880,7 +876,7 @@ def saveImage(slist, myBuild):
             if counter == 3600:
                 logging.info("Saving Image Timed out.  Exiting Builderdash")
                 sys.exit(1)
-    elif myBuild.cloudservice == 'gcp':
+    elif myBuild.env_provider == EnvProvider.GCP:
         logging.info("Saving Image")
         zone = myBuild.region
         source_disk = 'zones/' + str(zone) + '/disks/' + str(myBuild.instancename)
@@ -893,17 +889,18 @@ def saveImage(slist, myBuild):
         response = request.execute()
         logging.info(response)
         savedImage = response
-    elif myBuild.cloudservice == 'kubevirt':
+    elif myBuild.env_provider == EnvProvider.K8S_VM:
         logging.info('Saving kubevirt image -- really just recording a reference to the build instance persistent volume claim name and namespace.')
         savedImage = {
             "pvc": {
                 "name": 'root-data-volume-' + myBuild.instancename,
-                "namespace": myBuild.kubevirt_namespace
+                "namespace": myBuild.k8s_namespace
             }
         }
         logging.info('kubevirt pvc: ' + json.dumps(savedImage))
     # TODO: even though savedImage is returned is it ever really used?
     return(savedImage)
+
 
 ###########Execute a Command As Directly Typed##############################
 def commandsexec(commando, ssh, myBuild):
@@ -911,12 +908,14 @@ def commandsexec(commando, ssh, myBuild):
         commandString = str(key)
         runCommand(ssh, commandString, myBuild)
 
+
 #########Just a test function for touching .txt files########################
 def testtouch(touchy, ssh, myBuild):
     for key in touchy:
         logging.info(key)
         commandString = 'sudo touch ~/'+str(key)
         runCommand(ssh, commandString, myBuild)
+
 
 #########Tar Compress or Tar Extract Files#######################################
 def createOrExtract(tarlist, ssh, myBuild):
@@ -949,6 +948,7 @@ def createOrExtract(tarlist, ssh, myBuild):
             else:
                 logging.info('No action was specified in cfg file.  Could not compress or extract tar.')
 
+
 ##########Get Distribution of Local Operating System###############
 def get_distribution():
     dist = platform.dist()
@@ -957,6 +957,7 @@ def get_distribution():
         version = dist[1]
         supportdist = dist[2]
     return(distro)
+
 
 ##############Run Scripts###########################
 def sourceScripts(sslist, ssh, myBuild):
@@ -967,11 +968,13 @@ def sourceScripts(sslist, ssh, myBuild):
         commandString = 'sudo ' + str(key)
         runCommand(ssh, commandString, myBuild)
 
+
 #################Downloads Files#####################
 def downloads(dllist, ssh, myBuild):
     for source in dllist:
         commandString = 'sudo wget -P ' + str(dllist[source]) + ' ' + str(source)
         runCommand(ssh, commandString, myBuild)
+
 
 #################Extract Files######################################       
 def extract(exlist, ssh, myBuild):
@@ -982,9 +985,11 @@ def extract(exlist, ssh, myBuild):
         commandString = 'sudo tar ' + str(extract_method) + ' ' + str(filelocation) + ' -C ' + str(destination)
         runCommand(ssh, commandString, myBuild)
 
+
 ###############Install from packages###############################
 def repoRpms(rrlist, ssh, myBuild):
     runCommand(ssh, "sudo yum install -y " + " ".join(rrlist), myBuild)
+
 
 ##############Yum localinstall###########
 def pathRpms(prlist, ssh, myBuild):
@@ -992,6 +997,7 @@ def pathRpms(prlist, ssh, myBuild):
         logging.info(key)
         commandString = 'sudo yum localinstall ' + str(key) + ' -y'
         runCommand(ssh, commandString, myBuild)
+
 
 ##############Calls another builderdash script###############
 def builderdash(blist, ssh, myBuild):
@@ -1001,11 +1007,13 @@ def builderdash(blist, ssh, myBuild):
         subprocess.call('pwd', shell=True)
         runBuild(False, myBuild, ssh, str(key))
 
+
 #############Copies Files from one location to Another###############
 def copyFiles(cflist, ssh, myBuild):
     for key in cflist:
         commandString = 'sudo cp ' + str(key) + ' ' + str(cflist[key])
         runCommand(ssh, commandString, myBuild)
+
 
 #############Move Files from one location to Another###############
 def moveFiles(mflist, ssh, myBuild):
@@ -1013,11 +1021,13 @@ def moveFiles(mflist, ssh, myBuild):
         commandString = 'sudo mv ' + str(key) + ' ' + str(mflist[key])
         runCommand(ssh, commandString, myBuild)
 
+
 ################Delete Files#######################################
 def deleteFiles(delist, ssh, myBuild):
     for key in delist:
         commandString = 'sudo rm ' + str(key)
         runCommand(ssh, commandString, myBuild)
+
 
 #############Copies a Subtree######################################
 def copySubtree(cslist, ssh, myBuild):
@@ -1025,11 +1035,13 @@ def copySubtree(cslist, ssh, myBuild):
         commandString = 'sudo cp -R ' + str(key) + ' ' + str(cslist[key])
         runCommand(ssh, commandString, myBuild)
 
+
 #############Change Permissions###############################
 def chmod(cmlist, ssh, myBuild):
     for key in cmlist:
         commandString = 'sudo chmod ' + str(cmlist[key]) + ' ' + str(key)
         runCommand(ssh, commandString, myBuild)
+
 
 #############Change Ownsership###############################
 def chown(colist, ssh, myBuild):
@@ -1045,6 +1057,7 @@ def chown(colist, ssh, myBuild):
             file = str(colist[key][2])
         commandString = 'sudo chown ' + options + str(key) + group + ' ' + file
         runCommand(ssh, commandString, myBuild)
+
 
 def makeDirectory(mklist, ssh, myBuild):
     for key in mklist:
@@ -1070,7 +1083,7 @@ def upload_files(uploads, ssh):
 
 
 def deleteInstance(delList, myBuild):
-    if myBuild.cloudservice == 'aws':
+    if myBuild.env_provider == EnvProvider.AWS:
         session = botocore.session.get_session()
         client = session.create_client('ec2', region_name = str(myBuild.region))
         try:
@@ -1078,7 +1091,7 @@ def deleteInstance(delList, myBuild):
             logging.info(response)
         except:
             logging.info("Failed to delete instance.  Please do so manually")
-    elif myBuild.cloudservice == 'gcp':
+    elif myBuild.env_provider == EnvProvider.GCP:
         compute = googleapiclient.discovery.build('compute', 'v1', cache_discovery=False)
 
         deleted = None
@@ -1090,30 +1103,38 @@ def deleteInstance(delList, myBuild):
             logging.info(deleteResponse)
             if deleteResponse['status'] == "PENDING" or deleteResponse['status'] == "RUNNING":
                 deleted = True
-    elif myBuild.cloudservice == 'kubevirt':
+    elif myBuild.env_provider == EnvProvider.K8S_VM:
         logging.info('Deleting kubevirt instance: (actually, just stopping instance for now)' + myBuild.instancename)
         # For kubevirt, I think the instance needs to be stopped first; otherwise, deleting the vm will hang until it's stopped.
         stopInstance(myBuild)
+        # TODO
+        # delete_vm(myBuild.kubevirt_api, myBuild.k8s_namespace, myBuild.instancename)
         """
         try:
-            delete_vmi_output = subprocess.check_output(['kubectl', 'delete', 'vmi', myBuild.instancename,
-                                                       '--cascade=orphan']).strip()
-            logging.info('delete_vmi_output is: %s', delete_vmi_output)
-        except subprocess.CalledProcessError:
-            logging.error('kubectl failed to delete vmi')
+            kubectl_delete_vmi_output = run_kubectl(
+                ['kubectl', 'delete', 'vmi', myBuild.instancename, '--cascade=orphan'],
+                myBuild.k8s_auth_config,
+                myBuild.k8s_namespace
+            )
+            logging.info('kubectl_delete_vmi_output is: %s', kubectl_delete_vmi_output)
+        except subprocess.CalledProcessError as e:
+            logging.error('kubectl failed to delete vmi: %s', e)
         """
         # TODO THIS STILL HANGS!
         """
         try:
-            delete_vm_output = subprocess.check_output(['kubectl', 'delete', 'vm', myBuild.instancename,
-                                                       '--cascade=orphan']).strip()
-            logging.info('delete_vm_output is: %s', delete_vm_output)
-        except subprocess.CalledProcessError:
-            logging.error('kubectl failed to delete vm')
-            pass
+            kubectl_delete_vmi_output = run_kubectl(
+                ['kubectl', 'delete', 'vm', myBuild.instancename, '--cascade=orphan'],
+                myBuild.k8s_auth_config,
+                myBuild.k8s_namespace
+            )
+            logging.info('kubectl_delete_vmi_output is: %s', kubectl_delete_vmi_output)
+        except subprocess.CalledProcessError as e:
+            logging.error('kubectl failed to delete vm: %s', e)
         """
     else:
-        logging.info("No proper cloud service listed in Init Section of cfg file.")
+        logging.error("build has invalid env_provider")
+
 
 ########Append Files############
 def append(applist, ssh, myBuild):
@@ -1122,6 +1143,7 @@ def append(applist, ssh, myBuild):
         appendtext = re.escape(applist[key])
         commandString = "sudo sed -i '$ a\\" + appendtext + "' " + file
         runCommand(ssh, commandString, myBuild)
+
 
 #####Replace text Function->>>Work in progress#########
 def replaceText(replace, ssh, myBuild):
@@ -1141,6 +1163,7 @@ def replaceText(replace, ssh, myBuild):
             commandString = totaltext
             runCommand(ssh, commandString, myBuild)
 
+
 ######Handle npm's################
 def npm(nplist, ssh, myBuild):
     for x in range(len(nplist)):
@@ -1158,7 +1181,7 @@ def npm(nplist, ssh, myBuild):
 
 #########Handle reboots ##########################
 def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=3):
-    if myBuild.cloudservice in ("aws", "gcp", "kubevirt"):
+    if myBuild.env_provider in (EnvProvider.AWS, EnvProvider.GCP, EnvProvider.K8S_VM):
         commandString = "sudo reboot"
         runCommand(ssh, commandString, myBuild)
         counter = 0
@@ -1203,7 +1226,6 @@ def handleUserData(myBuild):
     else:
         myBuild.userdata = ""
     myBuild.userdata = str(myBuild.userdata)
-    return myBuild
 
 
 def parseConfig(scriptName):
@@ -1227,6 +1249,7 @@ def parseConfig(scriptName):
         config.append({section: list})
 
     return config
+
 
 def runBuild(root, myBuild, ssh, scriptName):
     if scriptName.endswith(".json"):
@@ -1273,12 +1296,14 @@ def runBuild(root, myBuild, ssh, scriptName):
             logging.exception("No connection exists, no need to disconnect")
         '''
 
+
 class CommandFilter(logging.Filter):
     def filter(self, record):
         if "commandoutput" in record.__dict__:
             return 0
         else:
             return 1
+
 
 def main(**kwargs):
     aparser = argparse.ArgumentParser(description="Builderdash - a utility to mash a bunch of stuff into someplace (cloud, or elsewhere) so others can use it.")

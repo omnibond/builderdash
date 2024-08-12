@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 def load_proxy_conf_file(proxy_yaml_conf_file):
     from builderdash.main import safe_load_yaml_file
+    proxy_yaml_conf_file = os.path.expanduser(proxy_yaml_conf_file)
     # 1-to-1 match with proxy-related params of builderdash.ssher constructor
     valid_keys = ['proxy_hostname',
                   'proxy_port',
@@ -41,6 +42,8 @@ def load_proxy_conf_file(proxy_yaml_conf_file):
             return None
         elif k == 'proxy_port' and v is None:
             pconf[k] = 22
+        elif k == 'proxy_key_filename':
+            pconf[k] = os.path.expanduser(v)
         elif k == 'proxy_missing_host_key_policy':
             # convert proxy_missing_host_key_policy string to actual paramiko policy or bail if not found / valid
             missing_host_key_policy = None
