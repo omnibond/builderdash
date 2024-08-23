@@ -32,6 +32,7 @@ from builderdash.kubevirt_operations import (
     delete_vm,
     generate_rendered_vm_yaml_manifest,
     stop_vmi,
+    wait_for_pvc_deletion_then_recreate,
 )
 from builderdash.ssher import SSHConnection, load_proxy_conf_file
 
@@ -558,9 +559,10 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
     logging.info(f"k8s_save_config_path: {k8s_save_config_path}")
     my_build.k8s_save_config(k8s_save_config_path, k8s_save_config_format)
 
-    my_build.kubevirt_api = kubernetes.client.CustomObjectsApi()
+    my_build.k8s_client_core_v1_api = kubernetes.client.CoreV1Api()
+    my_build.k8s_custom_objects_api = kubernetes.client.CustomObjectsApi()
 
-    logging.info(f"kubevirt_api is: {my_build.kubevirt_api}")
+    logging.info(f"k8s_custom_objects_api is: {my_build.k8s_custom_objects_api}")
     logging.info(f"Source image is:\n# BEGIN\n{json.dumps(my_build.sourceimage, indent=4)}\n# END")
 
     generate_and_set_instance_name(my_build, my_build.sourceimage)
@@ -583,7 +585,8 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
     logging.info('Applying generated kubevirt VM manifest for build instance and waiting for its IP...')
 
     ip_address = create_vm_and_wait_for_ip(
-        my_build.kubevirt_api,
+        my_build.k8s_client_core_v1_api,
+        my_build.k8s_custom_objects_api,
         my_build.k8s_namespace,
         my_build.instancename,
         vm_manifest,
@@ -820,7 +823,7 @@ def stopInstance(myBuild):
         result = compute.instances().stop(project=myBuild.projectname, zone=myBuild.region, instance=str(myBuild.instancename)).execute()
     elif myBuild.env_provider == EnvProvider.K8S_VM:
         try:
-            stop_vmi(myBuild.kubevirt_api, myBuild.k8s_namespace, myBuild.instancename)
+            stop_vmi(myBuild.k8s_custom_objects_api, myBuild.k8s_namespace, myBuild.instancename)
         except Exception as e:
             logging.error('failed to stop kubevirt vmi: %s', e)
     else:
@@ -891,9 +894,10 @@ def saveImage(slist, myBuild):
         savedImage = response
     elif myBuild.env_provider == EnvProvider.K8S_VM:
         logging.info('Saving kubevirt image -- really just recording a reference to the build instance persistent volume claim name and namespace.')
+        pvc_name = myBuild.instancename
         savedImage = {
             "pvc": {
-                "name": 'root-data-volume-' + myBuild.instancename,
+                "name": pvc_name,
                 "namespace": myBuild.k8s_namespace
             }
         }
@@ -1074,8 +1078,7 @@ def upload_files(uploads, ssh):
             ssh.file_upload(src, dst)
         except Exception as e:
             logging.error("upload_files raised an exception: %s", e)
-            # FIXME uncomment line below after stopInstance for kubevirt works better
-            #stopInstance(myBuild)
+            #stopInstance(myBuild)  # TODO
             sys.exit(1)
     logging.info("upload_files raised no exceptions.")
 
@@ -1104,34 +1107,14 @@ def deleteInstance(delList, myBuild):
             if deleteResponse['status'] == "PENDING" or deleteResponse['status'] == "RUNNING":
                 deleted = True
     elif myBuild.env_provider == EnvProvider.K8S_VM:
-        logging.info('Deleting kubevirt instance: (actually, just stopping instance for now)' + myBuild.instancename)
-        # For kubevirt, I think the instance needs to be stopped first; otherwise, deleting the vm will hang until it's stopped.
-        stopInstance(myBuild)
-        # TODO
-        # delete_vm(myBuild.kubevirt_api, myBuild.k8s_namespace, myBuild.instancename)
-        """
-        try:
-            kubectl_delete_vmi_output = run_kubectl(
-                ['kubectl', 'delete', 'vmi', myBuild.instancename, '--cascade=orphan'],
-                myBuild.k8s_auth_config,
-                myBuild.k8s_namespace
-            )
-            logging.info('kubectl_delete_vmi_output is: %s', kubectl_delete_vmi_output)
-        except subprocess.CalledProcessError as e:
-            logging.error('kubectl failed to delete vmi: %s', e)
-        """
-        # TODO THIS STILL HANGS!
-        """
-        try:
-            kubectl_delete_vmi_output = run_kubectl(
-                ['kubectl', 'delete', 'vm', myBuild.instancename, '--cascade=orphan'],
-                myBuild.k8s_auth_config,
-                myBuild.k8s_namespace
-            )
-            logging.info('kubectl_delete_vmi_output is: %s', kubectl_delete_vmi_output)
-        except subprocess.CalledProcessError as e:
-            logging.error('kubectl failed to delete vm: %s', e)
-        """
+        logging.info(f"Deleting kubevirt instance: {myBuild.instancename}")
+        delete_vm(myBuild.k8s_custom_objects_api, myBuild.k8s_namespace, myBuild.instancename)
+        ret = wait_for_pvc_deletion_then_recreate(myBuild)
+        if ret:
+            logging.info("PVC successfully re-created following deletion of VM and its original PVC.")
+        else:
+            logging.error("PVC failed to be re-created following deletion of VM and its original PVC.")
+            sys.exit(1)
     else:
         logging.error("build has invalid env_provider")
 
