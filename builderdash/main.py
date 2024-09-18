@@ -125,7 +125,7 @@ class Build:
             persist_config=False
         )
 
-        contexts, current_context = kubernetes.config.list_kube_config_contexts()
+        contexts, current_context = kubernetes.config.list_kube_config_contexts(config_file)
 
         # Extract the namespace from the current context
         current_namespace = current_context['context'].get('namespace', 'default')
