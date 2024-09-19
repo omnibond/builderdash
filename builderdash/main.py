@@ -553,11 +553,12 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
     logging.info('kubevirt_instance called')
     logging.info('my_build.env_provider is: %s', my_build.env_provider)
 
-    k8s_save_config_format = 'yaml'
-    k8s_save_config_path = os.path.join(os.getcwd(), f'k8s_config.{k8s_save_config_format}')
-    logging.info(f"Saving k8s configuration to local file so it may be reused by env.py via provider data.")
-    logging.info(f"k8s_save_config_path: {k8s_save_config_path}")
-    my_build.k8s_save_config(k8s_save_config_path, k8s_save_config_format)
+    if my_build.buildtype == 'control':
+        k8s_save_config_format = 'yaml'
+        k8s_save_config_path = os.path.join(os.getcwd(), f'k8s_config.{k8s_save_config_format}')
+        logging.info(f"Saving k8s configuration to local file so it may be reused by env.py via provider data.")
+        logging.info(f"k8s_save_config_path: {k8s_save_config_path}")
+        my_build.k8s_save_config(k8s_save_config_path, k8s_save_config_format)
 
     my_build.k8s_client_core_v1_api = kubernetes.client.CoreV1Api()
     my_build.k8s_custom_objects_api = kubernetes.client.CustomObjectsApi()
