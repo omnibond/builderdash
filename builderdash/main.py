@@ -892,6 +892,9 @@ def saveImage(slist, myBuild):
         time.sleep(120)
         response = request.execute()
         logging.info(response)
+
+        service.globalOperations().wait(project=myBuild.projectid, operation=response["name"])
+
         savedImage = response
     elif myBuild.env_provider == EnvProvider.K8S_VM:
         logging.info('Saving kubevirt image -- really just recording a reference to the build instance persistent volume claim name and namespace.')
