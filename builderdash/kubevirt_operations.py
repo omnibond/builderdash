@@ -64,7 +64,7 @@ vm_template = dedent('''\
           name: {pvc_name}
         spec:
           pvc:
-            storageClassName: {pvc_storage_class}
+            {pvc_storage_class}
             accessModes:
             - {pvc_access_mode}
             resources:
@@ -74,19 +74,17 @@ vm_template = dedent('''\
 
 
 def generate_vm_template_substitution_dictionary(my_build):
-    if hasattr(my_build, "disksize"):
-        disksize = my_build.disksize
-    else:
-        disksize = "55"
+    disksize = getattr(my_build, "disksize", "55")
 
     f = open(os.path.expanduser(my_build.pubkeypath), 'r')
     kubevirt_public_key_openssh = f.read()
     f.close()
 
-    if my_build.kubevirt_storage_class_name:
-        pvc_storage_class = ''
+    kubevirt_storage_class_name = getattr(my_build, "kubevirt_storage_class_name", None)
+    if kubevirt_storage_class_name is not None:
+        pvc_storage_class = f"storageClassName: {kubevirt_storage_class_name}"
     else:
-        pvc_storage_class = f"storageClassName: {my_build.kubevirt_storage_class_name}"
+        pvc_storage_class = ''
 
     return {
         'name': my_build.instancename,
@@ -251,8 +249,9 @@ def create_pvc_for_retained_pv(my_build, pv_name):
         }
     }
 
-    if my_build.kubevirt_storage_class_name:
-        pvc_manifest['spec']['storageClassName'] = my_build.kubevirt_storage_class_name
+    kubevirt_storage_class_name = getattr(my_build, "kubevirt_storage_class_name", None)
+    if kubevirt_storage_class_name is not None:
+        pvc_manifest['spec']['storageClassName'] = kubevirt_storage_class_name
 
     try:
         response = my_build.k8s_client_core_v1_api.create_namespaced_persistent_volume_claim(
