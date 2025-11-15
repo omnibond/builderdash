@@ -317,15 +317,83 @@ def wait_for_vmi_running(custom_objects_api, namespace, vmi_name, timeout, inter
 def extract_ip_address(vmi):
     try:
         interfaces = vmi.get('status', {}).get('interfaces', [])
-        if interfaces:
-            ip_address = interfaces[0].get('ipAddress')
-            return ip_address
-        else:
+        if not interfaces:
             logging.error("No interfaces found in VMI")
             return None
+
+        iface = interfaces[0]
+        ip_address = iface.get('ipAddress')
+
+        # Some KubeVirt versions populate ipAddresses instead / as well
+        if not ip_address:
+            ip_addresses = iface.get('ipAddresses') or []
+            if ip_addresses:
+                ip_address = ip_addresses[0]
+
+        if not ip_address:
+            logging.info("VMI has interfaces but no IP address yet")
+        return ip_address
     except Exception as e:
         logging.error(f"Exception when extracting IP address: {e}")
         return None
+
+
+def wait_for_vmi_ip(custom_objects_api, namespace, vmi_name, timeout, interval):
+    """
+    After the VMI reaches Running, there can still be a delay before
+    KubeVirt/CNI assign an IP and populate status.interfaces[*].ipAddress.
+
+    This helper polls for an IP, and returns the IP string or None on failure/timeout.
+    """
+    start_time = time.time()
+    last_phase = None
+
+    logging.info(
+        "Waiting for VMI %s in namespace %s to acquire an IP address (timeout=%s, interval=%s)",
+        vmi_name, namespace, timeout, interval,
+    )
+
+    while time.time() - start_time < timeout:
+        vmi = get_vmi(custom_objects_api, namespace, vmi_name)
+        if not vmi:
+            # get_vmi already logged; VMI may not exist yet or have disappeared
+            time.sleep(interval)
+            continue
+
+        status = vmi.get('status', {})
+        phase = status.get('phase', 'Unknown')
+        ip = extract_ip_address(vmi)
+
+        if phase != last_phase or not ip:
+            logging.info(
+                "VMI %s poll: phase=%s ip=%s",
+                vmi_name,
+                phase,
+                ip or "<None>",
+            )
+            last_phase = phase
+
+        # If IP is present, we’re done
+        if ip:
+            logging.info("VMI %s acquired IP %s", vmi_name, ip)
+            return ip
+
+        # If the VMI has terminated, no point in continuing
+        if phase in ("Failed", "Succeeded"):
+            logging.error(
+                "VMI %s reached terminal phase %s before acquiring an IP",
+                vmi_name,
+                phase,
+            )
+            return None
+
+        time.sleep(interval)
+
+    logging.error(
+        "Timeout waiting for VMI %s to acquire an IP address",
+        vmi_name,
+    )
+    return None
 
 
 def set_retainment_of_root_volume(
@@ -350,28 +418,67 @@ def create_vm_and_wait_for_ip(
         k8s_namespace,
         vm_name,
         manifest,
-        timeout=600,
+        timeout=600,          # total budget for running+IP
         interval=10,
         retain_root_volume=True,
 ):
+    start_time = time.time()
+
     vm = create_vm(custom_objects_api, k8s_namespace, manifest)
-    if vm:
-        vmi = wait_for_vmi_running(custom_objects_api, k8s_namespace, vm_name, timeout, interval)
-        if vmi:
-            if retain_root_volume:
-                try:
-                    set_retainment_of_root_volume(client_core_v1_api, k8s_namespace, vm_name)
-                except Exception:
-                    delete_vm(custom_objects_api, k8s_namespace, vm_name)
-                    return None
-            else:
-                logging.warning(f"retain_root_volume is False, root volume WILL BE DELETED when VM is deleted.")
-            return extract_ip_address(vmi)
-        else:
-            logging.error('failed to get VMI data')
-    else:
+    if not vm:
         logging.error('failed create kubevirt VM')
-    return None
+        return None
+
+    # ---- 1) Wait for VMI to be Running ----
+    remaining = timeout - (time.time() - start_time)
+    logging.info(f"[builderdash] Remaining time before wait_for_vmi_running: {remaining:.1f}s")
+
+    if remaining <= 0:
+        logging.error("Timeout expired before waiting for VMI to reach Running")
+        return None
+
+    vmi = wait_for_vmi_running(
+        custom_objects_api,
+        k8s_namespace,
+        vm_name,
+        timeout=remaining,
+        interval=interval,
+    )
+    if not vmi:
+        logging.error('failed to get VMI data (never reached Running)')
+        return None
+
+    # ---- 2) Retain root volume ----
+    if retain_root_volume:
+        try:
+            set_retainment_of_root_volume(client_core_v1_api, k8s_namespace, vm_name)
+        except Exception:
+            logging.exception(
+                "Failed to set retainment on root volume for VM %s; deleting VM", vm_name
+            )
+            delete_vm(custom_objects_api, k8s_namespace, vm_name)
+            return None
+    else:
+        logging.warning("retain_root_volume is False; root volume will be deleted with VM")
+
+    # ---- 3) Wait for VMI IP ----
+    remaining = timeout - (time.time() - start_time)
+    logging.info(f"[builderdash] Remaining time before wait_for_vmi_ip: {remaining:.1f}s")
+
+    if remaining <= 0:
+        logging.error("Timeout expired before waiting for VMI IP")
+        return None
+
+    ip = wait_for_vmi_ip(
+        custom_objects_api,
+        k8s_namespace,
+        vm_name,
+        timeout=remaining,
+        interval=interval,
+    )
+    logging.info(f"[builderdash] IP wait completed with remaining time: {timeout - (time.time() - start_time):.1f}s")
+
+    return ip
 
 
 def stop_vmi(custom_objects_api, k8s_namespace, vmi_name):
