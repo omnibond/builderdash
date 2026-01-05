@@ -1532,9 +1532,14 @@ def runBuild(root, myBuild, ssh, scriptName):
                 if ssh is not None:
                     logging.info("runBuild: New ssh.is_alive(): %s", ssh.is_alive())
 
-        # Process post_reboot sections if a reboot occurred
-        if reboot_occurred and post_reboot_sections:
-            logging.info("Processing post_reboot sections after reboot")
+        # Process post_reboot sections if a reboot occurred OR if this is a nested builderdash call (root=False) with only post_reboot sections
+        # In nested calls, we assume a reboot occurred in the parent context
+        should_process_post_reboot = (reboot_occurred and post_reboot_sections) or (not root and len(regular_sections) == 0 and len(post_reboot_sections) > 0)
+        if should_process_post_reboot:
+            if not root and len(regular_sections) == 0:
+                logging.info("Processing post_reboot sections (nested builderdash call with only post_reboot sections)")
+            else:
+                logging.info("Processing post_reboot sections after reboot")
             logging.info("runBuild: Before processing post_reboot sections, ssh object id: %s", id(ssh) if ssh else None)
             if ssh is not None:
                 logging.info("runBuild: ssh.is_alive() before post_reboot: %s", ssh.is_alive())
