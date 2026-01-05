@@ -783,11 +783,10 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
             # Verify SSH connection is still alive before using it
             if ssh is not None and not ssh.is_alive():
                 logging.warning("SSH connection is not alive, attempting to reconnect")
-                new_ssh = ssh_connect(myBuild)
-                if new_ssh is None:
+                ssh = ssh_connect(myBuild)
+                if ssh is None:
                     logging.error("Failed to reconnect SSH")
                     sys.exit(1)
-                ssh = new_ssh
             logging.info("running command as remote: %s", commandString)
             # Send the command (blocking)
             status, _, _ = ssh.run_command(commandString, get_pty=True,
@@ -800,8 +799,32 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
                 stopInstance(myBuild)
                 sys.exit(1)
         except Exception as e:
-            logging.exception('Exception is %s', e)
-            sys.exit(1)
+            # Check if it's an SSH session error and try to reconnect
+            error_str = str(e)
+            if isinstance(e, paramiko.ssh_exception.SSHException) and ("SSH session not active" in error_str or "not active" in error_str):
+                logging.warning("SSH session became inactive during command execution, attempting to reconnect")
+                ssh = ssh_connect(myBuild)
+                if ssh is None:
+                    logging.error("Failed to reconnect SSH after session error")
+                    sys.exit(1)
+                # Retry the command with the new connection
+                logging.info("Retrying command with reconnected SSH: %s", commandString)
+                try:
+                    status, _, _ = ssh.run_command(commandString, get_pty=True,
+                                                   stdout_log_func=logging.info, stderr_log_func=None,
+                                                   ret_stdout=False, ret_stderr=False,
+                                                   stdout_extra={"commandoutput": True}, stderr_extra=None)
+                    logging.info("Exit status is %d", status)
+                    if status != 0:
+                        logging.exception('ERROR running command after reconnect')
+                        stopInstance(myBuild)
+                        sys.exit(1)
+                except Exception as retry_e:
+                    logging.exception('Exception retrying command after reconnect: %s', retry_e)
+                    sys.exit(1)
+            else:
+                logging.exception('Exception is %s', e)
+                sys.exit(1)
     elif local is True or local == 'True':
         logging.info("running command as local: %s", commandString)
         try:
