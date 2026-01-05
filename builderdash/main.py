@@ -629,15 +629,7 @@ def dispatchOption(option, args, ssh, myBuild):
         pathRpms(args, ssh, myBuild)
         return None
     elif option == "builderdash":
-        logging.info("=== dispatchOption:builderdash ENTRY ===")
-        logging.info("dispatchOption:builderdash: Input ssh object id: %s", id(ssh) if ssh else None)
-        if ssh is not None:
-            logging.info("dispatchOption:builderdash: Input ssh.is_alive(): %s", ssh.is_alive())
         new_ssh = builderdash(args, ssh, myBuild)
-        logging.info("dispatchOption:builderdash: builderdash returned, new_ssh object id: %s", id(new_ssh) if new_ssh else None)
-        if new_ssh is not None:
-            logging.info("dispatchOption:builderdash: new_ssh.is_alive(): %s", new_ssh.is_alive())
-        logging.info("=== dispatchOption:builderdash EXIT ===")
         return new_ssh
     elif option == "copyfiles":
         copyFiles(args, ssh, myBuild)
@@ -679,15 +671,7 @@ def dispatchOption(option, args, ssh, myBuild):
         npm(args, ssh, myBuild)
         return None
     elif option == "reboot":
-        logging.info("=== dispatchOption:reboot ENTRY ===")
-        logging.info("dispatchOption:reboot: Input ssh object id: %s", id(ssh) if ssh else None)
-        if ssh is not None:
-            logging.info("dispatchOption:reboot: Input ssh.is_alive(): %s", ssh.is_alive())
         new_ssh = rebootFunc(args, ssh, myBuild)
-        logging.info("dispatchOption:reboot: rebootFunc returned, new_ssh object id: %s", id(new_ssh) if new_ssh else None)
-        if new_ssh is not None:
-            logging.info("dispatchOption:reboot: new_ssh.is_alive(): %s", new_ssh.is_alive())
-        logging.info("=== dispatchOption:reboot EXIT ===")
         return new_ssh
     elif option == "envvar":
         envVariables(args, ssh, myBuild)
@@ -704,10 +688,6 @@ def dispatchOption(option, args, ssh, myBuild):
 
 
 def processSection(configSection, ssh, myBuild):
-    logging.info("=== processSection ENTRY ===")
-    logging.info("processSection: Input ssh object id: %s, type: %s", id(ssh) if ssh else None, type(ssh).__name__ if ssh else None)
-    if ssh is not None:
-        logging.info("processSection: Input ssh.is_alive(): %s", ssh.is_alive())
     myBuild.timesprefix = myBuild.timesprefix + " "
     start_time = time.time()
     for key in configSection:
@@ -744,16 +724,9 @@ def processSection(configSection, ssh, myBuild):
                     runCheck = False
             if runCheck == True:
                 # dispatchOption may return a new SSH connection (e.g., after reboot)
-                logging.info("processSection: Before dispatchOption, ssh object id: %s", id(ssh) if ssh else None)
-                if ssh is not None:
-                    logging.info("processSection: Before dispatchOption, ssh.is_alive(): %s", ssh.is_alive())
                 new_ssh = dispatchOption(newoption, option[name], ssh, myBuild)
-                logging.info("processSection: After dispatchOption, new_ssh object id: %s", id(new_ssh) if new_ssh else None)
                 if new_ssh is not None:
-                    logging.info("processSection: Updating ssh from object id %s to %s", id(ssh) if ssh else None, id(new_ssh))
                     ssh = new_ssh
-                    if ssh is not None:
-                        logging.info("processSection: Updated ssh.is_alive(): %s", ssh.is_alive())
             else:
                 logging.info("Permission Tags Not in Build Type")
         except Exception as e:
@@ -762,10 +735,6 @@ def processSection(configSection, ssh, myBuild):
     myBuild.timesprefix = myBuild.timesprefix[:-1]
     end_time = time.time()
     myBuild.times.append((myBuild.timesprefix + config_key, end_time - start_time))
-    logging.info("=== processSection EXIT ===")
-    logging.info("processSection: Returning ssh object id: %s", id(ssh) if ssh else None)
-    if ssh is not None:
-        logging.info("processSection: Returning ssh.is_alive(): %s", ssh.is_alive())
     return ssh
 
 
@@ -805,8 +774,6 @@ def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
 
 ###########Run Commands on Instance######################################
 def runCommand(ssh, commandString, myBuild, **kwargs):
-    logging.info("=== runCommand ENTRY ===")
-    logging.info("runCommand: Input ssh object id: %s, type: %s", id(ssh) if ssh else None, type(ssh).__name__ if ssh else None)
     if 'local' in kwargs:
         local = kwargs['local']
     else:
@@ -814,23 +781,13 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
     if local is False or local == 'False':
         try:
             # Verify SSH connection is still alive before using it
-            logging.info("runCommand: Checking SSH connection before command execution")
-            logging.info("runCommand: Connection object id: %s", id(ssh) if ssh else None)
-            if ssh is not None:
-                is_alive_before = ssh.is_alive()
-                logging.info("runCommand: ssh.is_alive() before check: %s", is_alive_before)
-                if not is_alive_before:
-                    logging.warning("SSH connection is not alive, attempting to reconnect")
-                    ssh = ssh_connect(myBuild)
-                    logging.info("runCommand: New connection object id after reconnect: %s", id(ssh) if ssh else None)
-                    if ssh is None:
-                        logging.error("Failed to reconnect SSH")
-                        sys.exit(1)
-                    logging.info("runCommand: New connection is_alive(): %s", ssh.is_alive())
-            logging.info("runCommand: running command as remote: %s", commandString)
-            logging.info("runCommand: Connection object id before run_command: %s", id(ssh) if ssh else None)
-            if ssh is not None:
-                logging.info("runCommand: Connection is_alive() before run_command: %s", ssh.is_alive())
+            if ssh is not None and not ssh.is_alive():
+                logging.warning("SSH connection is not alive, attempting to reconnect")
+                ssh = ssh_connect(myBuild)
+                if ssh is None:
+                    logging.error("Failed to reconnect SSH")
+                    sys.exit(1)
+            logging.info("running command as remote: %s", commandString)
             # Send the command (blocking)
             status, _, _ = ssh.run_command(commandString, get_pty=True,
                                            stdout_log_func=logging.info, stderr_log_func=None,
@@ -842,28 +799,14 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
                 stopInstance(myBuild)
                 sys.exit(1)
         except Exception as e:
-            logging.info("=== runCommand EXCEPTION ===")
-            logging.info("runCommand: Exception type: %s", type(e).__name__)
-            logging.info("runCommand: Exception message: %s", str(e))
-            logging.info("runCommand: Connection object id at exception: %s", id(ssh) if ssh else None)
-            if ssh is not None:
-                try:
-                    is_alive_at_exception = ssh.is_alive()
-                    logging.info("runCommand: ssh.is_alive() at exception: %s", is_alive_at_exception)
-                except Exception as alive_check_e:
-                    logging.warning("runCommand: Could not check is_alive() at exception: %s", str(alive_check_e))
             # Check if it's an SSH session error and try to reconnect
             error_str = str(e)
             if isinstance(e, paramiko.ssh_exception.SSHException) and ("SSH session not active" in error_str or "not active" in error_str):
                 logging.warning("SSH session became inactive during command execution, attempting to reconnect")
-                logging.info("runCommand: Old connection object id: %s", id(ssh) if ssh else None)
                 ssh = ssh_connect(myBuild)
-                logging.info("runCommand: New connection object id after reconnect: %s", id(ssh) if ssh else None)
                 if ssh is None:
                     logging.error("Failed to reconnect SSH after session error")
                     sys.exit(1)
-                if ssh is not None:
-                    logging.info("runCommand: New connection is_alive(): %s", ssh.is_alive())
                 # Retry the command with the new connection
                 logging.info("Retrying command with reconnected SSH: %s", commandString)
                 try:
@@ -877,10 +820,10 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
                         stopInstance(myBuild)
                         sys.exit(1)
                 except Exception as retry_e:
-                    logging.exception('Exception retrying command after reconnect: %s (type: %s)', retry_e, type(retry_e).__name__)
+                    logging.exception('Exception retrying command after reconnect: %s', retry_e)
                     sys.exit(1)
             else:
-                logging.exception('Exception is %s (type: %s)', e, type(e).__name__)
+                logging.exception('Exception is %s', e)
                 sys.exit(1)
     elif local is True or local == 'True':
         logging.info("running command as local: %s", commandString)
@@ -922,7 +865,6 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
             sys.exit(1)
     else:
         logging.info("Couldn't get a local status")
-    logging.info("=== runCommand EXIT ===")
 
 
 ###########Stops the running instance##############################
@@ -1123,39 +1065,20 @@ def pathRpms(prlist, ssh, myBuild):
 
 ##############Calls another builderdash script###############
 def builderdash(blist, ssh, myBuild):
-    logging.info("=== builderdash ENTRY ===")
-    logging.info("builderdash: Input ssh object id: %s, type: %s", id(ssh) if ssh else None, type(ssh).__name__ if ssh else None)
-    if ssh is not None:
-        logging.info("builderdash: Input ssh.is_alive(): %s", ssh.is_alive())
     for key in blist:
         logging.info(key)
         logging.info("STARTING======>>>>>>>>>>"+str(key))
         subprocess.call('pwd', shell=True)
         # Verify SSH connection is still alive before using it
-        logging.info("builderdash: Checking SSH connection before runBuild")
-        logging.info("builderdash: Connection object id before check: %s", id(ssh) if ssh else None)
-        if ssh is not None:
-            is_alive_before = ssh.is_alive()
-            logging.info("builderdash: ssh.is_alive() before check: %s", is_alive_before)
-            if not is_alive_before:
-                logging.warning("SSH connection is not alive, attempting to reconnect")
-                ssh = ssh_connect(myBuild)
-                logging.info("builderdash: New connection object id after reconnect: %s", id(ssh) if ssh else None)
-                if ssh is None:
-                    logging.error("Failed to reconnect SSH")
-                    sys.exit(1)
-        logging.info("builderdash: About to call runBuild with ssh object id: %s", id(ssh) if ssh else None)
+        if ssh is not None and not ssh.is_alive():
+            logging.warning("SSH connection is not alive, attempting to reconnect")
+            ssh = ssh_connect(myBuild)
+            if ssh is None:
+                logging.error("Failed to reconnect SSH")
+                sys.exit(1)
         new_ssh = runBuild(False, myBuild, ssh, str(key))
-        logging.info("builderdash: runBuild returned, new_ssh object id: %s", id(new_ssh) if new_ssh else None)
         if new_ssh is not None:
-            logging.info("builderdash: Updating ssh from object id %s to %s", id(ssh) if ssh else None, id(new_ssh))
             ssh = new_ssh
-            if ssh is not None:
-                logging.info("builderdash: Updated ssh.is_alive(): %s", ssh.is_alive())
-    logging.info("=== builderdash EXIT ===")
-    logging.info("builderdash: Returning ssh object id: %s", id(ssh) if ssh else None)
-    if ssh is not None:
-        logging.info("builderdash: Returning ssh.is_alive(): %s", ssh.is_alive())
     return ssh
 
 
@@ -1311,23 +1234,15 @@ def npm(nplist, ssh, myBuild):
 
 #########Handle reboots ##########################
 def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5, verification_retry_limit=3):
-    logging.info("=== rebootFunc ENTRY ===")
-    logging.info("rebootFunc: Input ssh object id: %s, type: %s", id(ssh), type(ssh).__name__)
-    if ssh is not None:
-        logging.info("rebootFunc: Input ssh.is_alive(): %s", ssh.is_alive())
     if myBuild.env_provider in (EnvProvider.AWS, EnvProvider.GCP, EnvProvider.K8S_VM):
         commandString = "sudo reboot"
-        logging.info("rebootFunc: About to run reboot command")
         runCommand(ssh, commandString, myBuild)
-        logging.info("rebootFunc: Reboot command executed, waiting %d seconds", connection_delay)
         counter = 0
         logging.info("Attempting to reconnect after reboot")
         while True:
             time.sleep(connection_delay)
             try:
-                logging.info("rebootFunc: Attempting ssh_connect (attempt %d of %d)", counter + 1, retry_limit)
                 ssh = ssh_connect(myBuild)
-                logging.info("rebootFunc: ssh_connect returned, object id: %s, is None: %s", id(ssh) if ssh else None, ssh is None)
                 if ssh is None:
                     logging.info("Connection failed, trying again")
                     counter += 1
@@ -1337,24 +1252,17 @@ def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5, v
                     continue
                 
                 # Verify the connection is active and working
-                logging.info("rebootFunc: Verifying SSH connection is active and working")
-                logging.info("rebootFunc: Connection object id before verification: %s", id(ssh))
-                logging.info("rebootFunc: Connection is_alive() before verification: %s", ssh.is_alive())
+                logging.info("Verifying SSH connection is active and working")
                 verification_success = False
                 for verify_attempt in range(verification_retry_limit):
                     try:
-                        logging.info("rebootFunc: Verification attempt %d of %d", verify_attempt + 1, verification_retry_limit)
-                        logging.info("rebootFunc: Connection object id at start of verification: %s", id(ssh))
                         # Check if connection is alive
                         is_alive_result = ssh.is_alive()
-                        logging.info("rebootFunc: ssh.is_alive() result: %s", is_alive_result)
                         if not is_alive_result:
                             logging.warning("SSH connection is not alive, attempt %d of %d", verify_attempt + 1, verification_retry_limit)
                             if verify_attempt < verification_retry_limit - 1:
                                 time.sleep(5)
-                                logging.info("rebootFunc: Reconnecting for verification retry")
                                 ssh = ssh_connect(myBuild)
-                                logging.info("rebootFunc: New connection object id: %s", id(ssh) if ssh else None)
                                 if ssh is None:
                                     continue
                             else:
@@ -1362,12 +1270,9 @@ def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5, v
                         
                         # Try a simple test command to verify the connection works
                         test_command = "echo 'SSH connection test'"
-                        logging.info("rebootFunc: Running test command: %s", test_command)
-                        logging.info("rebootFunc: Connection object id before test command: %s", id(ssh))
                         status, _, _ = ssh.run_command(test_command, get_pty=True,
                                                       stdout_log_func=None, stderr_log_func=None,
                                                       ret_stdout=False, ret_stderr=False)
-                        logging.info("rebootFunc: Test command status: %d", status)
                         if status == 0:
                             logging.info("SSH connection verified and working")
                             verification_success = True
@@ -1377,29 +1282,22 @@ def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5, v
                                           status, verify_attempt + 1, verification_retry_limit)
                             if verify_attempt < verification_retry_limit - 1:
                                 time.sleep(5)
-                                logging.info("rebootFunc: Reconnecting after test command failure")
                                 ssh = ssh_connect(myBuild)
-                                logging.info("rebootFunc: New connection object id: %s", id(ssh) if ssh else None)
                                 if ssh is None:
                                     continue
                     except Exception as verify_e:
-                        logging.warning("SSH verification failed: %s (type: %s), attempt %d of %d", 
-                                      str(verify_e), type(verify_e).__name__, verify_attempt + 1, verification_retry_limit)
-                        logging.exception("rebootFunc: Full verification exception traceback")
+                        logging.warning("SSH verification failed: %s, attempt %d of %d", 
+                                      str(verify_e), verify_attempt + 1, verification_retry_limit)
                         if verify_attempt < verification_retry_limit - 1:
                             time.sleep(5)
-                            logging.info("rebootFunc: Reconnecting after verification exception")
                             ssh = ssh_connect(myBuild)
-                            logging.info("rebootFunc: New connection object id: %s", id(ssh) if ssh else None)
                             if ssh is None:
                                 continue
                         else:
                             break
                 
                 if verification_success:
-                    logging.info("rebootFunc: Connection successful and verified")
-                    logging.info("rebootFunc: Final connection object id: %s", id(ssh))
-                    logging.info("rebootFunc: Final connection is_alive(): %s", ssh.is_alive())
+                    logging.info("Connection successful and verified")
                     break
                 else:
                     logging.warning("SSH connection verification failed, retrying connection")
@@ -1410,16 +1308,11 @@ def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5, v
                     continue
                     
             except Exception as e:
-                logging.info("Error reconnecting: %s (type: %s), trying again", str(e), type(e).__name__)
-                logging.exception("rebootFunc: Full reconnection exception traceback")
+                logging.info("Error reconnecting: %s, trying again", str(e))
                 counter += 1
                 if counter >= retry_limit:
                     logging.exception("Reboot Failed")
                     sys.exit(1)
-    logging.info("=== rebootFunc EXIT ===")
-    logging.info("rebootFunc: Returning ssh object id: %s", id(ssh) if ssh else None)
-    if ssh is not None:
-        logging.info("rebootFunc: Returning ssh.is_alive(): %s", ssh.is_alive())
     return ssh
 
 
@@ -1470,11 +1363,6 @@ def parseConfig(scriptName):
 
 
 def runBuild(root, myBuild, ssh, scriptName):
-    logging.info("=== runBuild ENTRY ===")
-    logging.info("runBuild: root=%s, scriptName=%s", root, scriptName)
-    logging.info("runBuild: Input ssh object id: %s, type: %s", id(ssh) if ssh else None, type(ssh).__name__ if ssh else None)
-    if ssh is not None:
-        logging.info("runBuild: Input ssh.is_alive(): %s", ssh.is_alive())
     if scriptName.endswith(".json"):
         with open(scriptName) as f:
             config = json.load(f.read())
@@ -1493,11 +1381,9 @@ def runBuild(root, myBuild, ssh, scriptName):
     try:
         if root:
             ssh = processInitSection(config[0], myBuild)
-            logging.info("runBuild: After processInitSection, ssh object id: %s", id(ssh) if ssh else None)
             rest = config[1:]
         else:
             rest = config
-            logging.info("runBuild: Not root, using input ssh object id: %s", id(ssh) if ssh else None)
 
         reboot_occurred = False
         regular_sections = []
@@ -1514,23 +1400,14 @@ def runBuild(root, myBuild, ssh, scriptName):
             else:
                 regular_sections.append(section)
 
-        logging.info("runBuild: Found %d regular sections and %d post_reboot sections", len(regular_sections), len(post_reboot_sections))
-
         # Process regular sections
         for section in regular_sections:
             old_ssh = ssh
-            logging.info("runBuild: Processing regular section, ssh object id: %s", id(ssh) if ssh else None)
-            if ssh is not None:
-                logging.info("runBuild: ssh.is_alive() before processSection: %s", ssh.is_alive())
             new_ssh = processSection(section, ssh, myBuild)
-            logging.info("runBuild: processSection returned, new_ssh object id: %s", id(new_ssh) if new_ssh else None)
             if new_ssh is not None and new_ssh is not old_ssh:
-                logging.info("runBuild: SSH connection changed from object id %s to %s", id(old_ssh) if old_ssh else None, id(new_ssh))
                 ssh = new_ssh
                 reboot_occurred = True
                 logging.info("Reboot detected, will process post_reboot sections after regular sections complete")
-                if ssh is not None:
-                    logging.info("runBuild: New ssh.is_alive(): %s", ssh.is_alive())
 
         # Process post_reboot sections if a reboot occurred OR if this is a nested builderdash call (root=False) with only post_reboot sections
         # In nested calls, we assume a reboot occurred in the parent context
@@ -1540,33 +1417,18 @@ def runBuild(root, myBuild, ssh, scriptName):
                 logging.info("Processing post_reboot sections (nested builderdash call with only post_reboot sections)")
             else:
                 logging.info("Processing post_reboot sections after reboot")
-            logging.info("runBuild: Before processing post_reboot sections, ssh object id: %s", id(ssh) if ssh else None)
-            if ssh is not None:
-                logging.info("runBuild: ssh.is_alive() before post_reboot: %s", ssh.is_alive())
             for section in post_reboot_sections:
-                logging.info("runBuild: Processing post_reboot section, ssh object id: %s", id(ssh) if ssh else None)
                 ssh = processSection(section, ssh, myBuild)
-                logging.info("runBuild: After post_reboot processSection, ssh object id: %s", id(ssh) if ssh else None)
-                if ssh is not None:
-                    logging.info("runBuild: ssh.is_alive() after post_reboot: %s", ssh.is_alive())
     except Exception as e:
         logging.exception("Error in initReturnList")
         stopInstance(myBuild)
-        logging.info("=== runBuild EXIT (exception) ===")
-        logging.info("runBuild: Returning ssh object id: %s", id(ssh) if ssh else None)
         return ssh
 
     if root:
-        logging.info("runBuild: Root mode, disconnecting ssh")
         ssh.disconnect()
-        logging.info("=== runBuild EXIT (root) ===")
         return None
     else:
         # Return the SSH connection so nested builderdash calls can use the updated connection
-        logging.info("=== runBuild EXIT (non-root) ===")
-        logging.info("runBuild: Returning ssh object id: %s", id(ssh) if ssh else None)
-        if ssh is not None:
-            logging.info("runBuild: Returning ssh.is_alive(): %s", ssh.is_alive())
         return ssh
         # TODO delete this after testing refactor of connectionObj to SSHConnection
         '''
