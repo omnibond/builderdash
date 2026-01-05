@@ -629,8 +629,8 @@ def dispatchOption(option, args, ssh, myBuild):
         pathRpms(args, ssh, myBuild)
         return None
     elif option == "builderdash":
-        builderdash(args, ssh, myBuild)
-        return None
+        new_ssh = builderdash(args, ssh, myBuild)
+        return new_ssh
     elif option == "copyfiles":
         copyFiles(args, ssh, myBuild)
         return None
@@ -780,6 +780,14 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
         local = myBuild.local
     if local is False or local == 'False':
         try:
+            # Verify SSH connection is still alive before using it
+            if ssh is not None and not ssh.is_alive():
+                logging.warning("SSH connection is not alive, attempting to reconnect")
+                new_ssh = ssh_connect(myBuild)
+                if new_ssh is None:
+                    logging.error("Failed to reconnect SSH")
+                    sys.exit(1)
+                ssh = new_ssh
             logging.info("running command as remote: %s", commandString)
             # Send the command (blocking)
             status, _, _ = ssh.run_command(commandString, get_pty=True,
@@ -1038,7 +1046,17 @@ def builderdash(blist, ssh, myBuild):
         logging.info(key)
         logging.info("STARTING======>>>>>>>>>>"+str(key))
         subprocess.call('pwd', shell=True)
-        runBuild(False, myBuild, ssh, str(key))
+        # Verify SSH connection is still alive before using it
+        if ssh is not None and not ssh.is_alive():
+            logging.warning("SSH connection is not alive, attempting to reconnect")
+            ssh = ssh_connect(myBuild)
+            if ssh is None:
+                logging.error("Failed to reconnect SSH")
+                sys.exit(1)
+        new_ssh = runBuild(False, myBuild, ssh, str(key))
+        if new_ssh is not None:
+            ssh = new_ssh
+    return ssh
 
 
 #############Copies Files from one location to Another###############
@@ -1318,9 +1336,13 @@ def runBuild(root, myBuild, ssh, scriptName):
     except Exception as e:
         logging.exception("Error in initReturnList")
         stopInstance(myBuild)
+        return ssh
 
     if root:
         ssh.disconnect()
+    else:
+        # Return the SSH connection so nested builderdash calls can use the updated connection
+        return ssh
         # TODO delete this after testing refactor of connectionObj to SSHConnection
         '''
         try:
