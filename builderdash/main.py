@@ -1233,7 +1233,7 @@ def npm(nplist, ssh, myBuild):
 
 
 #########Handle reboots ##########################
-def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=3):
+def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5):
     if myBuild.env_provider in (EnvProvider.AWS, EnvProvider.GCP, EnvProvider.K8S_VM):
         commandString = "sudo reboot"
         runCommand(ssh, commandString, myBuild)
