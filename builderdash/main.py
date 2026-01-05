@@ -606,60 +606,82 @@ def dispatchOption(option, args, ssh, myBuild):
     logging.info("%s %s", option, args)
     if option == "testtouch":
         testtouch(args, ssh, myBuild)
+        return None
     elif option == "mkdir":
         makeDirectory(args, ssh, myBuild)
+        return None
     elif option == "upload_files":
         upload_files(args, ssh)
+        return None
     # TODO
     #elif option == "download_files":
     #    download_files(args, ssh)
     elif option == "downloads":
         downloads(args, ssh, myBuild)
+        return None
     elif option == "extract":
         extract(args, ssh, myBuild)
+        return None
     elif option == "reporpms":
         repoRpms(args, ssh, myBuild)
+        return None
     elif option == "pathrpms":
         pathRpms(args, ssh, myBuild)
+        return None
     elif option == "builderdash":
         builderdash(args, ssh, myBuild)
+        return None
     elif option == "copyfiles":
         copyFiles(args, ssh, myBuild)
+        return None
     elif option == "movefiles":
         moveFiles(args, ssh, myBuild)
+        return None
     elif option == "copysubtree":
         copySubtree(args, ssh, myBuild)
+        return None
     elif option == "chmod":
         chmod(args, ssh, myBuild)
+        return None
     elif option == "chown":
         chown(args, ssh, myBuild)
+        return None
     elif option == "sourcescripts":
         sourceScripts(args, ssh, myBuild)
+        return None
     elif option == "delete":
         deleteFiles(args, ssh, myBuild)
+        return None
     elif option == "commands":
         commandsexec(args, ssh, myBuild)
+        return None
     elif option == "saveimage":
         savedImage = saveImage(args, myBuild)
+        return None
     elif option == "deleteinstance":
         deleteInstance(args, myBuild)
+        return None
     elif option == "append":
         append(args, ssh, myBuild)
+        return None
     elif option == "replace":
         replaceText(args, ssh, myBuild)
+        return None
     elif option == "npm":
         npm(args, ssh, myBuild)
+        return None
     elif option == "reboot":
-        rebootFunc(args, ssh, myBuild)
-        # FIXME: this return value is never used by caller of dispatchOption (the function: processSection)
-        #connectionObj = rebootFunc(args, connectionObj, myBuild)
-        #return {'newConnect': connectionObj}
+        new_ssh = rebootFunc(args, ssh, myBuild)
+        return new_ssh
     elif option == "envvar":
         envVariables(args, ssh, myBuild)
+        return None
     elif option == "tar":
         createOrExtract(args, ssh, myBuild)
+        return None
     elif option == "cloudyvars":
         setCloudyClusterEnvVars(ssh, myBuild)
+        return None
     else:
         logging.error("Option %s not recognized", option)
         sys.exit(1)
@@ -701,8 +723,10 @@ def processSection(configSection, ssh, myBuild):
                 else:
                     runCheck = False
             if runCheck == True:
-                # TODO: Check with Mary: processSection expects this function to return a value (in the case the first arg is 'reboot')
-                dispatchOption(newoption, option[name], ssh, myBuild)
+                # dispatchOption may return a new SSH connection (e.g., after reboot)
+                new_ssh = dispatchOption(newoption, option[name], ssh, myBuild)
+                if new_ssh is not None:
+                    ssh = new_ssh
             else:
                 logging.info("Permission Tags Not in Build Type")
         except Exception as e:
@@ -711,6 +735,7 @@ def processSection(configSection, ssh, myBuild):
     myBuild.timesprefix = myBuild.timesprefix[:-1]
     end_time = time.time()
     myBuild.times.append((myBuild.timesprefix + config_key, end_time - start_time))
+    return ssh
 
 
 def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
@@ -1261,14 +1286,35 @@ def runBuild(root, myBuild, ssh, scriptName):
         else:
             rest = config
 
+        reboot_occurred = False
+        regular_sections = []
+        post_reboot_sections = []
+
+        # Separate regular sections from post_reboot sections
         for section in rest:
-            processSection(section, ssh, myBuild)
-            # FIXME: processSection never returns a value so the following never runs
-            '''
-            x = processSection(section, connectionObj, myBuild)
-            if hasattr(x, 'newConnect'):
-                connectionObj = x['newConnect']
-            '''
+            section_key = None
+            for key in section:
+                section_key = key
+                break
+            if section_key and section_key.lower() == "post_reboot":
+                post_reboot_sections.append(section)
+            else:
+                regular_sections.append(section)
+
+        # Process regular sections
+        for section in regular_sections:
+            old_ssh = ssh
+            new_ssh = processSection(section, ssh, myBuild)
+            if new_ssh is not None and new_ssh is not old_ssh:
+                ssh = new_ssh
+                reboot_occurred = True
+                logging.info("Reboot detected, will process post_reboot sections after regular sections complete")
+
+        # Process post_reboot sections if a reboot occurred
+        if reboot_occurred and post_reboot_sections:
+            logging.info("Processing post_reboot sections after reboot")
+            for section in post_reboot_sections:
+                ssh = processSection(section, ssh, myBuild)
     except Exception as e:
         logging.exception("Error in initReturnList")
         stopInstance(myBuild)
