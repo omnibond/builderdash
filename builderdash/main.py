@@ -606,60 +606,82 @@ def dispatchOption(option, args, ssh, myBuild):
     logging.info("%s %s", option, args)
     if option == "testtouch":
         testtouch(args, ssh, myBuild)
+        return None
     elif option == "mkdir":
         makeDirectory(args, ssh, myBuild)
+        return None
     elif option == "upload_files":
         upload_files(args, ssh)
+        return None
     # TODO
     #elif option == "download_files":
     #    download_files(args, ssh)
     elif option == "downloads":
         downloads(args, ssh, myBuild)
+        return None
     elif option == "extract":
         extract(args, ssh, myBuild)
+        return None
     elif option == "reporpms":
         repoRpms(args, ssh, myBuild)
+        return None
     elif option == "pathrpms":
         pathRpms(args, ssh, myBuild)
+        return None
     elif option == "builderdash":
-        builderdash(args, ssh, myBuild)
+        new_ssh = builderdash(args, ssh, myBuild)
+        return new_ssh
     elif option == "copyfiles":
         copyFiles(args, ssh, myBuild)
+        return None
     elif option == "movefiles":
         moveFiles(args, ssh, myBuild)
+        return None
     elif option == "copysubtree":
         copySubtree(args, ssh, myBuild)
+        return None
     elif option == "chmod":
         chmod(args, ssh, myBuild)
+        return None
     elif option == "chown":
         chown(args, ssh, myBuild)
+        return None
     elif option == "sourcescripts":
         sourceScripts(args, ssh, myBuild)
+        return None
     elif option == "delete":
         deleteFiles(args, ssh, myBuild)
+        return None
     elif option == "commands":
         commandsexec(args, ssh, myBuild)
+        return None
     elif option == "saveimage":
         savedImage = saveImage(args, myBuild)
+        return None
     elif option == "deleteinstance":
         deleteInstance(args, myBuild)
+        return None
     elif option == "append":
         append(args, ssh, myBuild)
+        return None
     elif option == "replace":
         replaceText(args, ssh, myBuild)
+        return None
     elif option == "npm":
         npm(args, ssh, myBuild)
+        return None
     elif option == "reboot":
-        rebootFunc(args, ssh, myBuild)
-        # FIXME: this return value is never used by caller of dispatchOption (the function: processSection)
-        #connectionObj = rebootFunc(args, connectionObj, myBuild)
-        #return {'newConnect': connectionObj}
+        new_ssh = rebootFunc(args, ssh, myBuild)
+        return new_ssh
     elif option == "envvar":
         envVariables(args, ssh, myBuild)
+        return None
     elif option == "tar":
         createOrExtract(args, ssh, myBuild)
+        return None
     elif option == "cloudyvars":
         setCloudyClusterEnvVars(ssh, myBuild)
+        return None
     else:
         logging.error("Option %s not recognized", option)
         sys.exit(1)
@@ -701,8 +723,10 @@ def processSection(configSection, ssh, myBuild):
                 else:
                     runCheck = False
             if runCheck == True:
-                # TODO: Check with Mary: processSection expects this function to return a value (in the case the first arg is 'reboot')
-                dispatchOption(newoption, option[name], ssh, myBuild)
+                # dispatchOption may return a new SSH connection (e.g., after reboot)
+                new_ssh = dispatchOption(newoption, option[name], ssh, myBuild)
+                if new_ssh is not None:
+                    ssh = new_ssh
             else:
                 logging.info("Permission Tags Not in Build Type")
         except Exception as e:
@@ -711,6 +735,7 @@ def processSection(configSection, ssh, myBuild):
     myBuild.timesprefix = myBuild.timesprefix[:-1]
     end_time = time.time()
     myBuild.times.append((myBuild.timesprefix + config_key, end_time - start_time))
+    return ssh
 
 
 def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
@@ -755,6 +780,13 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
         local = myBuild.local
     if local is False or local == 'False':
         try:
+            # Verify SSH connection is still alive before using it
+            if ssh is not None and not ssh.is_alive():
+                logging.warning("SSH connection is not alive, attempting to reconnect")
+                ssh = ssh_connect(myBuild)
+                if ssh is None:
+                    logging.error("Failed to reconnect SSH")
+                    sys.exit(1)
             logging.info("running command as remote: %s", commandString)
             # Send the command (blocking)
             status, _, _ = ssh.run_command(commandString, get_pty=True,
@@ -767,8 +799,32 @@ def runCommand(ssh, commandString, myBuild, **kwargs):
                 stopInstance(myBuild)
                 sys.exit(1)
         except Exception as e:
-            logging.exception('Exception is %s', e)
-            sys.exit(1)
+            # Check if it's an SSH session error and try to reconnect
+            error_str = str(e)
+            if isinstance(e, paramiko.ssh_exception.SSHException) and ("SSH session not active" in error_str or "not active" in error_str):
+                logging.warning("SSH session became inactive during command execution, attempting to reconnect")
+                ssh = ssh_connect(myBuild)
+                if ssh is None:
+                    logging.error("Failed to reconnect SSH after session error")
+                    sys.exit(1)
+                # Retry the command with the new connection
+                logging.info("Retrying command with reconnected SSH: %s", commandString)
+                try:
+                    status, _, _ = ssh.run_command(commandString, get_pty=True,
+                                                   stdout_log_func=logging.info, stderr_log_func=None,
+                                                   ret_stdout=False, ret_stderr=False,
+                                                   stdout_extra={"commandoutput": True}, stderr_extra=None)
+                    logging.info("Exit status is %d", status)
+                    if status != 0:
+                        logging.exception('ERROR running command after reconnect')
+                        stopInstance(myBuild)
+                        sys.exit(1)
+                except Exception as retry_e:
+                    logging.exception('Exception retrying command after reconnect: %s', retry_e)
+                    sys.exit(1)
+            else:
+                logging.exception('Exception is %s', e)
+                sys.exit(1)
     elif local is True or local == 'True':
         logging.info("running command as local: %s", commandString)
         try:
@@ -1013,7 +1069,17 @@ def builderdash(blist, ssh, myBuild):
         logging.info(key)
         logging.info("STARTING======>>>>>>>>>>"+str(key))
         subprocess.call('pwd', shell=True)
-        runBuild(False, myBuild, ssh, str(key))
+        # Verify SSH connection is still alive before using it
+        if ssh is not None and not ssh.is_alive():
+            logging.warning("SSH connection is not alive, attempting to reconnect")
+            ssh = ssh_connect(myBuild)
+            if ssh is None:
+                logging.error("Failed to reconnect SSH")
+                sys.exit(1)
+        new_ssh = runBuild(False, myBuild, ssh, str(key))
+        if new_ssh is not None:
+            ssh = new_ssh
+    return ssh
 
 
 #############Copies Files from one location to Another###############
@@ -1167,7 +1233,7 @@ def npm(nplist, ssh, myBuild):
 
 
 #########Handle reboots ##########################
-def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=3):
+def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5):
     if myBuild.env_provider in (EnvProvider.AWS, EnvProvider.GCP, EnvProvider.K8S_VM):
         commandString = "sudo reboot"
         runCommand(ssh, commandString, myBuild)
@@ -1177,18 +1243,26 @@ def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=3):
             time.sleep(connection_delay)
             try:
                 ssh = ssh_connect(myBuild)
+                if ssh is None:
+                    logging.info("Connection failed, trying again")
+                    counter += 1
+                    if counter >= retry_limit:
+                        logging.exception("Reboot Failed: Could not establish SSH connection")
+                        sys.exit(1)
+                    continue
+                
+                # ssh_connect() already verifies the connection is alive before returning it
+                # If we have a connection, it's ready for use. Any failures will be caught
+                # by error handling in the actual commands that follow.
                 logging.info("Connection successful")
                 break
+                    
             except Exception as e:
-                logging.info("Error reconnecting, trying again")
+                logging.info("Error reconnecting: %s, trying again", str(e))
                 counter += 1
-                if counter < retry_limit:
-                    pass
-                else:
+                if counter >= retry_limit:
                     logging.exception("Reboot Failed")
                     sys.exit(1)
-    # TODO how does this ever get used? It seems to not be passed up to processSection
-    #return connectionObj
     return ssh
 
 
@@ -1261,20 +1335,51 @@ def runBuild(root, myBuild, ssh, scriptName):
         else:
             rest = config
 
+        reboot_occurred = False
+        regular_sections = []
+        post_reboot_sections = []
+
+        # Separate regular sections from post_reboot sections
         for section in rest:
-            processSection(section, ssh, myBuild)
-            # FIXME: processSection never returns a value so the following never runs
-            '''
-            x = processSection(section, connectionObj, myBuild)
-            if hasattr(x, 'newConnect'):
-                connectionObj = x['newConnect']
-            '''
+            section_key = None
+            for key in section:
+                section_key = key
+                break
+            if section_key and section_key.lower() == "post_reboot":
+                post_reboot_sections.append(section)
+            else:
+                regular_sections.append(section)
+
+        # Process regular sections
+        for section in regular_sections:
+            old_ssh = ssh
+            new_ssh = processSection(section, ssh, myBuild)
+            if new_ssh is not None and new_ssh is not old_ssh:
+                ssh = new_ssh
+                reboot_occurred = True
+                logging.info("Reboot detected, will process post_reboot sections after regular sections complete")
+
+        # Process post_reboot sections if a reboot occurred OR if this is a nested builderdash call (root=False) with only post_reboot sections
+        # In nested calls, we assume a reboot occurred in the parent context
+        should_process_post_reboot = (reboot_occurred and post_reboot_sections) or (not root and len(regular_sections) == 0 and len(post_reboot_sections) > 0)
+        if should_process_post_reboot:
+            if not root and len(regular_sections) == 0:
+                logging.info("Processing post_reboot sections (nested builderdash call with only post_reboot sections)")
+            else:
+                logging.info("Processing post_reboot sections after reboot")
+            for section in post_reboot_sections:
+                ssh = processSection(section, ssh, myBuild)
     except Exception as e:
         logging.exception("Error in initReturnList")
         stopInstance(myBuild)
+        return ssh
 
     if root:
         ssh.disconnect()
+        return None
+    else:
+        # Return the SSH connection so nested builderdash calls can use the updated connection
+        return ssh
         # TODO delete this after testing refactor of connectionObj to SSHConnection
         '''
         try:
