@@ -1233,7 +1233,7 @@ def npm(nplist, ssh, myBuild):
 
 
 #########Handle reboots ##########################
-def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5, verification_retry_limit=3):
+def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5):
     if myBuild.env_provider in (EnvProvider.AWS, EnvProvider.GCP, EnvProvider.K8S_VM):
         commandString = "sudo reboot"
         runCommand(ssh, commandString, myBuild)
@@ -1251,61 +1251,11 @@ def rebootFunc(rebootCheck, ssh, myBuild, connection_delay=180, retry_limit=5, v
                         sys.exit(1)
                     continue
                 
-                # Verify the connection is active and working
-                logging.info("Verifying SSH connection is active and working")
-                verification_success = False
-                for verify_attempt in range(verification_retry_limit):
-                    try:
-                        # Check if connection is alive
-                        is_alive_result = ssh.is_alive()
-                        if not is_alive_result:
-                            logging.warning("SSH connection is not alive, attempt %d of %d", verify_attempt + 1, verification_retry_limit)
-                            if verify_attempt < verification_retry_limit - 1:
-                                time.sleep(5)
-                                ssh = ssh_connect(myBuild)
-                                if ssh is None:
-                                    continue
-                            else:
-                                break
-                        
-                        # Try a simple test command to verify the connection works
-                        test_command = "echo 'SSH connection test'"
-                        status, _, _ = ssh.run_command(test_command, get_pty=True,
-                                                      stdout_log_func=None, stderr_log_func=None,
-                                                      ret_stdout=False, ret_stderr=False)
-                        if status == 0:
-                            logging.info("SSH connection verified and working")
-                            verification_success = True
-                            break
-                        else:
-                            logging.warning("SSH test command failed with status %d, attempt %d of %d", 
-                                          status, verify_attempt + 1, verification_retry_limit)
-                            if verify_attempt < verification_retry_limit - 1:
-                                time.sleep(5)
-                                ssh = ssh_connect(myBuild)
-                                if ssh is None:
-                                    continue
-                    except Exception as verify_e:
-                        logging.warning("SSH verification failed: %s, attempt %d of %d", 
-                                      str(verify_e), verify_attempt + 1, verification_retry_limit)
-                        if verify_attempt < verification_retry_limit - 1:
-                            time.sleep(5)
-                            ssh = ssh_connect(myBuild)
-                            if ssh is None:
-                                continue
-                        else:
-                            break
-                
-                if verification_success:
-                    logging.info("Connection successful and verified")
-                    break
-                else:
-                    logging.warning("SSH connection verification failed, retrying connection")
-                    counter += 1
-                    if counter >= retry_limit:
-                        logging.exception("Reboot Failed: Could not verify SSH connection")
-                        sys.exit(1)
-                    continue
+                # ssh_connect() already verifies the connection is alive before returning it
+                # If we have a connection, it's ready for use. Any failures will be caught
+                # by error handling in the actual commands that follow.
+                logging.info("Connection successful")
+                break
                     
             except Exception as e:
                 logging.info("Error reconnecting: %s, trying again", str(e))
