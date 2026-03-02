@@ -11,7 +11,7 @@ setuptools.setup(
     long_description_content_type="text/plain",
     url="https://www.cloudycluster.com/",
     packages=setuptools.find_packages(),
-    python_requires='>=3.6',
+    python_requires='>=3.9',
     install_requires=[
         'botocore',
         'google-api-python-client',
