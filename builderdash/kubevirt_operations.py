@@ -10,6 +10,36 @@ from kubernetes.client.rest import ApiException
 
 logger = logging.getLogger(__name__)
 
+_UNSET_STORAGE_CLASS_VALUES = {"", "none", "null"}
+
+
+def normalize_kubevirt_storage_class_name(value):
+    if value is None:
+        return None
+
+    storage_class_name = str(value).strip()
+    if storage_class_name.lower() in _UNSET_STORAGE_CLASS_VALUES:
+        return None
+
+    return storage_class_name
+
+
+def get_build_kubevirt_storage_class_name(my_build):
+    return normalize_kubevirt_storage_class_name(
+        getattr(my_build, "kubevirt_storage_class_name", None)
+    )
+
+
+def get_pv_storage_class_name(client_core_v1_api, pv_name):
+    pv = client_core_v1_api.read_persistent_volume(pv_name)
+    return pv.spec.storage_class_name
+
+
+def render_pvc_storage_class(storage_class_name):
+    if storage_class_name is None:
+        return ''
+    return f"storageClassName: {storage_class_name}"
+
 vm_template = dedent('''\
     apiVersion: kubevirt.io/v1
     kind: VirtualMachine
@@ -80,11 +110,7 @@ def generate_vm_template_substitution_dictionary(my_build):
     kubevirt_public_key_openssh = f.read()
     f.close()
 
-    kubevirt_storage_class_name = getattr(my_build, "kubevirt_storage_class_name", None)
-    if kubevirt_storage_class_name is not None:
-        pvc_storage_class = f"storageClassName: {kubevirt_storage_class_name}"
-    else:
-        pvc_storage_class = ''
+    pvc_storage_class = render_pvc_storage_class(get_build_kubevirt_storage_class_name(my_build))
 
     return {
         'name': my_build.instancename,
@@ -172,7 +198,16 @@ def get_pv_name_from_pvc(client_core_v1_api, namespace, pvc_name):
 
 
 def patch_pv_to_retain(client_core_v1_api, pv_name):
-    # Define the patch to set the PV reclaim policy to Retain
+    try:
+        pv = client_core_v1_api.read_persistent_volume(pv_name)
+    except ApiException as e:
+        logging.error(f"Exception when reading PV '{pv_name}' before retain patch: {e}")
+        raise
+
+    if pv.spec.persistent_volume_reclaim_policy == "Retain":
+        logging.info(f"PV '{pv_name}' already has reclaim policy Retain; skipping patch.")
+        return
+
     pv_patch = {
         "spec": {
             "persistentVolumeReclaimPolicy": "Retain"
@@ -249,8 +284,14 @@ def create_pvc_for_retained_pv(my_build, pv_name):
         }
     }
 
-    kubevirt_storage_class_name = getattr(my_build, "kubevirt_storage_class_name", None)
-    if kubevirt_storage_class_name is not None:
+    kubevirt_storage_class_name = get_build_kubevirt_storage_class_name(my_build)
+    if kubevirt_storage_class_name is None:
+        pv_storage_class_name = get_pv_storage_class_name(my_build.k8s_client_core_v1_api, pv_name)
+        if pv_storage_class_name is None:
+            pvc_manifest['spec']['storageClassName'] = ''
+        else:
+            pvc_manifest['spec']['storageClassName'] = pv_storage_class_name
+    else:
         pvc_manifest['spec']['storageClassName'] = kubevirt_storage_class_name
 
     try:
