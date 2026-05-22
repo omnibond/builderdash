@@ -30,9 +30,10 @@ import kubernetes
 from builderdash.kubevirt_operations import (
     create_vm_and_wait_for_ip,
     delete_vm,
+    generate_data_volume_manifest,
     generate_rendered_vm_yaml_manifest,
+    get_pvc,
     stop_vmi,
-    wait_for_pvc_deletion_then_recreate,
 )
 from builderdash.ssher import SSHConnection, load_proxy_conf_file
 
@@ -586,8 +587,13 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
     my_build.instanceId = None
 
     rendered_manifest = generate_rendered_vm_yaml_manifest(my_build)
+    data_volume_manifest = generate_data_volume_manifest(my_build)
 
     logging.info(f'Rendered kubevirt VM instance yaml manifest:\n# BEGIN\n{rendered_manifest}\n# END')
+    logging.info(
+        "Rendered standalone kubevirt DataVolume yaml manifest:\n# BEGIN\n%s# END",
+        yaml.safe_dump(data_volume_manifest, sort_keys=False)
+    )
 
     try:
         vm_manifest = yaml.safe_load(rendered_manifest)
@@ -603,6 +609,7 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
         my_build.k8s_namespace,
         my_build.instancename,
         vm_manifest,
+        data_volume_manifest,
         timeout=timeout,
         interval=interval
     )
@@ -911,12 +918,27 @@ def saveImage(slist, myBuild):
     elif myBuild.env_provider == EnvProvider.K8S_VM:
         logging.info('Saving kubevirt image -- really just recording a reference to the build instance persistent volume claim name and namespace.')
         pvc_name = myBuild.instancename
+        try:
+            pvc = get_pvc(myBuild.k8s_client_core_v1_api, myBuild.k8s_namespace, pvc_name)
+        except Exception:
+            logging.exception(
+                "Failed to read KubeVirt image PVC '%s/%s' before recording image metadata.",
+                myBuild.k8s_namespace,
+                pvc_name,
+            )
+            sys.exit(1)
+
         savedImage = {
             "pvc": {
                 "name": pvc_name,
                 "namespace": myBuild.k8s_namespace
             }
         }
+        if pvc.spec.storage_class_name is not None:
+            savedImage["pvc"]["storageClassName"] = pvc.spec.storage_class_name
+        if pvc.spec.volume_name is not None:
+            savedImage["pvc"]["volumeName"] = pvc.spec.volume_name
+
         logging.info('kubevirt pvc: ' + json.dumps(savedImage))
     # TODO: even though savedImage is returned is it ever really used?
     return(savedImage)
@@ -1125,12 +1147,11 @@ def deleteInstance(delList, myBuild):
     elif myBuild.env_provider == EnvProvider.K8S_VM:
         logging.info(f"Deleting kubevirt instance: {myBuild.instancename}")
         delete_vm(myBuild.k8s_custom_objects_api, myBuild.k8s_namespace, myBuild.instancename)
-        ret = wait_for_pvc_deletion_then_recreate(myBuild)
-        if ret:
-            logging.info("PVC successfully re-created following deletion of VM and its original PVC.")
-        else:
-            logging.error("PVC failed to be re-created following deletion of VM and its original PVC.")
-            sys.exit(1)
+        logging.info(
+            "KubeVirt VM deleted. Standalone DataVolume/PVC '%s/%s' remains as the saved image artifact.",
+            myBuild.k8s_namespace,
+            myBuild.instancename,
+        )
     else:
         logging.error("build has invalid env_provider")
 
