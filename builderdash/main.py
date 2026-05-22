@@ -587,7 +587,11 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
     my_build.instanceId = None
 
     rendered_manifest = generate_rendered_vm_yaml_manifest(my_build)
-    data_volume_manifest = generate_data_volume_manifest(my_build)
+    try:
+        data_volume_manifest = generate_data_volume_manifest(my_build)
+    except ValueError as e:
+        logging.error(str(e))
+        sys.exit(1)
 
     logging.info(f'Rendered kubevirt VM instance yaml manifest:\n# BEGIN\n{rendered_manifest}\n# END')
     logging.info(

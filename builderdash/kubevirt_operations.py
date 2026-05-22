@@ -15,21 +15,39 @@ DATAVOLUME_PLURAL = "datavolumes"
 _UNSET_STORAGE_CLASS_VALUES = {"", "none", "null"}
 
 
-def normalize_kubevirt_storage_class_name(value):
+def normalize_k8s_storage_class(value):
     if value is None:
         return None
 
-    storage_class_name = str(value).strip()
-    if storage_class_name.lower() in _UNSET_STORAGE_CLASS_VALUES:
+    storage_class = str(value).strip()
+    if storage_class.lower() in _UNSET_STORAGE_CLASS_VALUES:
         return None
 
-    return storage_class_name
+    return storage_class
 
 
-def get_build_kubevirt_storage_class_name(my_build):
-    return normalize_kubevirt_storage_class_name(
+def get_build_k8s_storage_class(my_build):
+    storage_class = normalize_k8s_storage_class(
+        getattr(my_build, "k8s_storage_class", None)
+    )
+    legacy_storage_class = normalize_k8s_storage_class(
         getattr(my_build, "kubevirt_storage_class_name", None)
     )
+
+    if storage_class and legacy_storage_class and storage_class != legacy_storage_class:
+        raise ValueError(
+            "Builderdash KubeVirt config defines both k8s_storage_class and legacy "
+            f"kubevirt_storage_class_name with different values: {storage_class!r} != {legacy_storage_class!r}"
+        )
+
+    storage_class = storage_class or legacy_storage_class
+    if storage_class is None:
+        raise ValueError(
+            "KubeVirt image builds require k8s_storage_class in the builderdash config. "
+            "Set it to a StorageClass that exists on the target Kubernetes cluster."
+        )
+
+    return storage_class
 
 
 vm_template = dedent('''\
@@ -124,9 +142,7 @@ def generate_data_volume_manifest(my_build):
         }
     }
 
-    storage_class_name = get_build_kubevirt_storage_class_name(my_build)
-    if storage_class_name is not None:
-        pvc_spec["storageClassName"] = storage_class_name
+    pvc_spec["storageClassName"] = get_build_k8s_storage_class(my_build)
 
     return {
         "apiVersion": f"{CDI_GROUP}/{CDI_VERSION}",
