@@ -64,6 +64,17 @@ class EnvProvider(str, Enum):
         ]
 
 
+def normalize_kubernetes_client_bearer_token():
+    kube_config = kubernetes.client.Configuration.get_default_copy()
+    if 'authorization' not in kube_config.api_key or 'BearerToken' in kube_config.api_key:
+        return False
+
+    # kubernetes 36 loads kubeconfig tokens as "authorization", while generated APIs expect "BearerToken".
+    kube_config.api_key['BearerToken'] = kube_config.api_key['authorization']
+    kubernetes.client.Configuration.set_default(kube_config)
+    return True
+
+
 class Build:
     tagList = None
     env_provider = None
@@ -124,6 +135,7 @@ class Build:
             context=getattr(self, 'k8s_kubeconfig_context', None),
             persist_config=False
         )
+        normalize_kubernetes_client_bearer_token()
 
         contexts, current_context = kubernetes.config.list_kube_config_contexts(config_file)
 
