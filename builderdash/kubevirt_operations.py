@@ -1,14 +1,54 @@
-import json
 import logging
 import os
 import time
 from textwrap import dedent
 
-import yaml
 from kubernetes import client as client
 from kubernetes.client.rest import ApiException
 
 logger = logging.getLogger(__name__)
+
+CDI_GROUP = "cdi.kubevirt.io"
+CDI_VERSION = "v1beta1"
+DATAVOLUME_PLURAL = "datavolumes"
+
+_UNSET_STORAGE_CLASS_VALUES = {"", "none", "null"}
+
+
+def normalize_k8s_storage_class(value):
+    if value is None:
+        return None
+
+    storage_class = str(value).strip()
+    if storage_class.lower() in _UNSET_STORAGE_CLASS_VALUES:
+        return None
+
+    return storage_class
+
+
+def get_build_k8s_storage_class(my_build):
+    storage_class = normalize_k8s_storage_class(
+        getattr(my_build, "k8s_storage_class", None)
+    )
+    legacy_storage_class = normalize_k8s_storage_class(
+        getattr(my_build, "kubevirt_storage_class_name", None)
+    )
+
+    if storage_class and legacy_storage_class and storage_class != legacy_storage_class:
+        raise ValueError(
+            "Builderdash KubeVirt config defines both k8s_storage_class and legacy "
+            f"kubevirt_storage_class_name with different values: {storage_class!r} != {legacy_storage_class!r}"
+        )
+
+    storage_class = storage_class or legacy_storage_class
+    if storage_class is None:
+        raise ValueError(
+            "KubeVirt image builds require k8s_storage_class in the builderdash config. "
+            "Set it to a StorageClass that exists on the target Kubernetes cluster."
+        )
+
+    return storage_class
+
 
 vm_template = dedent('''\
     apiVersion: kubevirt.io/v1
@@ -58,19 +98,7 @@ vm_template = dedent('''\
                       - {public_key_openssh}
           - name: {root_disk_name}
             dataVolume:
-              name: {pvc_name}
-      dataVolumeTemplates:
-      - metadata:
-          name: {pvc_name}
-        spec:
-          pvc:
-            {pvc_storage_class}
-            accessModes:
-            - {pvc_access_mode}
-            resources:
-              requests:
-                storage: {pvc_storage_capacity}
-          source: {data_volume_source}''')
+              name: {pvc_name}''')
 
 
 def generate_vm_template_substitution_dictionary(my_build):
@@ -79,12 +107,6 @@ def generate_vm_template_substitution_dictionary(my_build):
     f = open(os.path.expanduser(my_build.pubkeypath), 'r')
     kubevirt_public_key_openssh = f.read()
     f.close()
-
-    kubevirt_storage_class_name = getattr(my_build, "kubevirt_storage_class_name", None)
-    if kubevirt_storage_class_name is not None:
-        pvc_storage_class = f"storageClassName: {kubevirt_storage_class_name}"
-    else:
-        pvc_storage_class = ''
 
     return {
         'name': my_build.instancename,
@@ -98,7 +120,6 @@ def generate_vm_template_substitution_dictionary(my_build):
         'ssh_user': str(my_build.sshkeyuser),
         'public_key_openssh': kubevirt_public_key_openssh,
         'pvc_name': my_build.instancename,
-        'pvc_storage_class': pvc_storage_class,
         'pvc_access_mode': 'ReadWriteOnce',
         'pvc_storage_capacity': disksize,
         'data_volume_source': my_build.sourceimage,
@@ -108,6 +129,49 @@ def generate_vm_template_substitution_dictionary(my_build):
 
 def generate_rendered_vm_yaml_manifest(my_build):
     return vm_template.format(**generate_vm_template_substitution_dictionary(my_build))
+
+
+def generate_data_volume_manifest(my_build):
+    d = generate_vm_template_substitution_dictionary(my_build)
+    pvc_spec = {
+        "accessModes": [d['pvc_access_mode']],
+        "resources": {
+            "requests": {
+                "storage": d['pvc_storage_capacity']
+            }
+        }
+    }
+
+    pvc_spec["storageClassName"] = get_build_k8s_storage_class(my_build)
+
+    return {
+        "apiVersion": f"{CDI_GROUP}/{CDI_VERSION}",
+        "kind": "DataVolume",
+        "metadata": {
+            "name": d['pvc_name'],
+            "namespace": d['namespace'],
+        },
+        "spec": {
+            "pvc": pvc_spec,
+            "source": d['data_volume_source'],
+        }
+    }
+
+
+def create_data_volume(custom_objects_api, namespace, manifest):
+    try:
+        api_response = custom_objects_api.create_namespaced_custom_object(
+            group=CDI_GROUP,
+            version=CDI_VERSION,
+            namespace=namespace,
+            plural=DATAVOLUME_PLURAL,
+            body=manifest
+        )
+        logging.info('Standalone DataVolume created successfully')
+        return api_response
+    except ApiException as e:
+        logging.error(f"Exception when creating standalone DataVolume: {e}")
+        return None
 
 
 def create_vm(custom_objects_api, namespace, manifest):
@@ -159,20 +223,25 @@ def get_vmi(custom_objects_api, namespace, vmi_name):
         return None
 
 
-def get_pv_name_from_pvc(client_core_v1_api, namespace, pvc_name):
-    # Retrieve the PVC object from the specified namespace
+def get_pvc(client_core_v1_api, namespace, pvc_name):
     try:
-        pvc = client_core_v1_api.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+        return client_core_v1_api.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
     except ApiException as e:
         logging.error(f"Exception when reading namespaced PVC '{pvc_name}' from namespace '{namespace}': {e}")
         raise
 
-    # Return the name of the PV bound to this PVC
-    return pvc.spec.volume_name
-
 
 def patch_pv_to_retain(client_core_v1_api, pv_name):
-    # Define the patch to set the PV reclaim policy to Retain
+    try:
+        pv = client_core_v1_api.read_persistent_volume(pv_name)
+    except ApiException as e:
+        logging.error(f"Exception when reading PV '{pv_name}' before retain patch: {e}")
+        raise
+
+    if pv.spec.persistent_volume_reclaim_policy == "Retain":
+        logging.info(f"PV '{pv_name}' already has reclaim policy Retain; skipping patch.")
+        return
+
     pv_patch = {
         "spec": {
             "persistentVolumeReclaimPolicy": "Retain"
@@ -186,118 +255,27 @@ def patch_pv_to_retain(client_core_v1_api, pv_name):
         raise
 
 
-def patch_pv_to_nullify_claim_ref(client_core_v1_api, pv_name):
-    # Define the patch to set the claimRef to null (Unbind the PV)
-    pv_patch = {
-        "spec": {
-            "claimRef": None
-        }
-    }
-    try:
-        client_core_v1_api.patch_persistent_volume(pv_name, pv_patch)
-        logging.info(f"Successfully patched PV '{pv_name}' to set the claimRef to null.")
-    except ApiException as e:
-        logging.error(f"Exception when patching PV '{pv_name}' to set the claimRef to null: {e}")
-        raise
-
-
-def wait_for_pvc_to_be_deleted(client_core_v1_api, namespace, pvc_name, timeout, interval):
-    logging.info(f"Waiting for PVC '{pvc_name}' to be deleted...")
+def wait_for_pvc_bound(client_core_v1_api, namespace, pvc_name, timeout, interval):
+    logging.info(f"Waiting for PVC '{pvc_name}' in namespace '{namespace}' to bind...")
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            client_core_v1_api.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-            logging.info(f"PVC '{pvc_name}' still exists, waiting...")
-            time.sleep(interval)  # Wait and retry
+            pvc = client_core_v1_api.read_namespaced_persistent_volume_claim(pvc_name, namespace)
         except ApiException as e:
             if e.status == 404:
-                logging.info(f"PVC '{pvc_name}' has been deleted.")
-                return True
+                logging.info(f"PVC '{pvc_name}' does not exist yet, waiting...")
             else:
                 raise
-    logging.error("Timeout waiting for kubevirt VMI to become ready")
-    return False
-
-
-def create_pvc_for_retained_pv(my_build, pv_name):
-    """
-     This function creates a new PVC to replace the PVC that was deleted when the VM was deleted.
-     This function is intended to be executed after the VM, that was associated with this PVC, is deleted.
-     The VM, its previous PVC, and its new PVC all share the same name -- by convention.
-    """
-
-    d = generate_vm_template_substitution_dictionary(my_build)
-
-    # naming PVC after VM name
-    pvc_name = d['name']
-
-    pvc_manifest = {
-        "apiVersion": "v1",
-        "kind": "PersistentVolumeClaim",
-        "metadata": {
-            "name": pvc_name,
-            "namespace": d['namespace']
-        },
-        "spec": {
-            "accessModes": [d['pvc_access_mode']],
-            "resources": {
-                "requests": {
-                    "storage": d['pvc_storage_capacity']
-                }
-            },
-            "volumeName": pv_name
-        }
-    }
-
-    kubevirt_storage_class_name = getattr(my_build, "kubevirt_storage_class_name", None)
-    if kubevirt_storage_class_name is not None:
-        pvc_manifest['spec']['storageClassName'] = kubevirt_storage_class_name
-
-    try:
-        response = my_build.k8s_client_core_v1_api.create_namespaced_persistent_volume_claim(
-            d['namespace'],
-            pvc_manifest
-        )
-    except client.exceptions.ApiException as e:
-        logging.error(f"Exception when creating PVC: {e}")
-        raise
-    else:
-        logging.info(f"PVC '{pvc_name}' created successfully.")
-        return response
-
-
-def wait_for_pvc_deletion_then_recreate(my_build, timeout=600, interval=1):
-    """
-    Re-create the PVC after the VM has been deleted. The first PVC associated with the VM must be deleted by the time
-    create_pvc_for_retained_pv is called or else it will likely raise an exception.
-
-    Background:
-    For builderdash, the lifecycle of the PVC should be managed separately from the kubevirt VM.
-
-    When a kubevirt VM is created with a dataVolumeTemplates section, a PVC is created and its lifecycle is bound to
-    that of the VM; however, we want the PVC to exist beyond the deletion of the VM so that it may be reused later on
-    without additional steps being required of the user of the desired build output image.
-
-    To support that, another PVC is created after the VM and its original PVC have been deleted. The new PVC is bound to
-    the original PV that was retained.
-    """
-    pvc_name = my_build.instancename
-    try:
-        pv_name = get_pv_name_from_pvc(my_build.k8s_client_core_v1_api, my_build.k8s_namespace, pvc_name)
-    except Exception:
-        return False
-
-    ret = wait_for_pvc_to_be_deleted(my_build.k8s_client_core_v1_api, my_build.k8s_namespace, pvc_name, timeout,
-                                     interval)
-    if ret:
-        try:
-            patch_pv_to_nullify_claim_ref(my_build.k8s_client_core_v1_api, pv_name)
-            create_pvc_for_retained_pv(my_build, pv_name)
-        except Exception:
-            return False
         else:
-            return True
-    return False
+            phase = pvc.status.phase
+            volume_name = pvc.spec.volume_name
+            if phase == "Bound" and volume_name:
+                logging.info(f"PVC '{pvc_name}' is Bound to PV '{volume_name}'.")
+                return pvc
+            logging.info(f"PVC '{pvc_name}' phase is '{phase}', waiting...")
+        time.sleep(interval)
+    logging.error(f"Timeout waiting for PVC '{pvc_name}' to bind")
+    return None
 
 
 def wait_for_vmi_running(custom_objects_api, namespace, vmi_name, timeout, interval):
@@ -396,40 +374,62 @@ def wait_for_vmi_ip(custom_objects_api, namespace, vmi_name, timeout, interval):
     return None
 
 
-def set_retainment_of_root_volume(
-        client_core_v1_api,
-        k8s_namespace,
-        vm_name,
-):
-    try:
-        pvc_name = vm_name
-        pv_name = get_pv_name_from_pvc(client_core_v1_api, k8s_namespace, pvc_name)
-        patch_pv_to_retain(client_core_v1_api, pv_name)
-    except ApiException:
-        raise
-    except Exception as e:
-        logging.error(f"Unexpected exception when trying to get PV name and retain PV: {e}")
-        raise
-
-
 def create_vm_and_wait_for_ip(
         client_core_v1_api,
         custom_objects_api,
         k8s_namespace,
         vm_name,
         manifest,
+        data_volume_manifest,
         timeout=600,          # total budget for running+IP
         interval=10,
         retain_root_volume=True,
 ):
     start_time = time.time()
 
+    data_volume = create_data_volume(custom_objects_api, k8s_namespace, data_volume_manifest)
+    if not data_volume:
+        logging.error('failed to create standalone DataVolume')
+        return None
+
     vm = create_vm(custom_objects_api, k8s_namespace, manifest)
     if not vm:
         logging.error('failed create kubevirt VM')
         return None
 
-    # ---- 1) Wait for VMI to be Running ----
+    # ---- 1) Wait for the standalone DataVolume's PVC to bind ----
+    remaining = timeout - (time.time() - start_time)
+    logging.info(f"[builderdash] Remaining time before wait_for_pvc_bound: {remaining:.1f}s")
+
+    if remaining <= 0:
+        logging.error("Timeout expired before waiting for root PVC to bind")
+        return None
+
+    pvc = wait_for_pvc_bound(
+        client_core_v1_api,
+        k8s_namespace,
+        vm_name,
+        timeout=remaining,
+        interval=interval,
+    )
+    if not pvc:
+        logging.error('failed to get bound root PVC')
+        return None
+
+    # ---- 2) Retain root volume ----
+    if retain_root_volume:
+        try:
+            patch_pv_to_retain(client_core_v1_api, pvc.spec.volume_name)
+        except Exception:
+            logging.exception(
+                "Failed to set retainment on root volume for VM %s; deleting VM", vm_name
+            )
+            delete_vm(custom_objects_api, k8s_namespace, vm_name)
+            return None
+    else:
+        logging.warning("retain_root_volume is False; root volume will be deleted if its PVC is deleted")
+
+    # ---- 3) Wait for VMI to be Running ----
     remaining = timeout - (time.time() - start_time)
     logging.info(f"[builderdash] Remaining time before wait_for_vmi_running: {remaining:.1f}s")
 
@@ -448,20 +448,7 @@ def create_vm_and_wait_for_ip(
         logging.error('failed to get VMI data (never reached Running)')
         return None
 
-    # ---- 2) Retain root volume ----
-    if retain_root_volume:
-        try:
-            set_retainment_of_root_volume(client_core_v1_api, k8s_namespace, vm_name)
-        except Exception:
-            logging.exception(
-                "Failed to set retainment on root volume for VM %s; deleting VM", vm_name
-            )
-            delete_vm(custom_objects_api, k8s_namespace, vm_name)
-            return None
-    else:
-        logging.warning("retain_root_volume is False; root volume will be deleted with VM")
-
-    # ---- 3) Wait for VMI IP ----
+    # ---- 4) Wait for VMI IP ----
     remaining = timeout - (time.time() - start_time)
     logging.info(f"[builderdash] Remaining time before wait_for_vmi_ip: {remaining:.1f}s")
 
