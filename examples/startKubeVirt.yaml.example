@@ -1,0 +1,62 @@
+# KubeVirt build on a namespaced account (for example NRP Nautilus).
+# Copy to startKubeVirt.yaml and adjust. Placeholder values are in <>.
+- start:
+  - local: false
+  - sshkeyname: builderdash
+  - sshkeyuser: builderdash
+  - sshkey: /home/USER/.ssh/kubevirt_ssh_key
+  - pubkeypath: /home/USER/.ssh/kubevirt_ssh_key.pub
+  - kubevirt_plain_text_passwd: <builder password>
+  - cloudservice: kubevirt
+  - ostype: almalinux
+  - buildtype: control
+  - instancename: nrp-rel10
+  - addhash: false
+  - disksize: 35Gi
+  - sourceimage:
+      http:
+        url: <https URL of the base qcow2>
+
+  # Cluster access
+  - k8s_kubeconfig_path: ~/.kube/nrp-omnibond.kubeconfig
+  - k8s_kubeconfig_context: nautilus-omnibond
+  - k8s_namespace: omnibond
+
+  # SSH: kubectl port-forward to the virt-launcher pod (default for kubevirt)
+  - k8s_ssh_transport: kubectl
+  - build_host_ssh_port: 22
+
+  # Size: cluster-wide common-instancetype (u1.2xlarge also works)
+  - instancetype: u1.xlarge
+  - k8s_instancetype_kind: VirtualMachineClusterInstancetype
+  - k8s_resources:
+      requests:
+        ephemeral-storage: 5Gi
+      limits:
+        ephemeral-storage: 5Gi
+
+  # Placement
+  - k8s_node_affinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values: [<approved node hostnames>]
+  - k8s_tolerations:
+    - key: <taint key>
+      operator: Exists
+      effect: PreferNoSchedule
+
+  # Image disk
+  - k8s_storage_class: rook-ceph-block-central
+  - k8s_access_modes: [ReadWriteOnce]
+  - k8s_volume_mode: Filesystem
+
+  # Extra labels (builderdash adds build, run-id and image labels itself)
+  - k8s_labels:
+      eureka.omnibond.com/build: nrp-rel10
+
+- build:
+  - builderdash:
+    - build.yaml

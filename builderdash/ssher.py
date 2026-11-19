@@ -154,7 +154,8 @@ class SSHConnection:
                  target_retry_delay=None, target_missing_host_key_policy=None,
                  proxy_hostname=None, proxy_port=22, proxy_username=None, proxy_password=None,
                  proxy_key_filename=None, proxy_passphrase=None, proxy_timeout=None, proxy_attempt_limit=None,
-                 proxy_retry_delay=None, proxy_missing_host_key_policy=None, proxy_channel_alt_src_hostname=None):
+                 proxy_retry_delay=None, proxy_missing_host_key_policy=None, proxy_channel_alt_src_hostname=None,
+                 target_sock_factory=None):
         logger.debug('called')
         self.target_hostname = target_hostname
         self.target_port = int(target_port)
@@ -182,6 +183,10 @@ class SSHConnection:
         self.proxy_missing_host_key_policy = paramiko.RejectPolicy() if proxy_missing_host_key_policy is None else (
             proxy_missing_host_key_policy)
         self.proxy_channel_alt_src_hostname = proxy_channel_alt_src_hostname
+        # Optional callable returning a fresh socket-like object for each target connect attempt
+        # (e.g. paramiko.ProxyCommand for `virtctl port-forward --stdio`). Not used with a proxy host.
+        self.target_sock_factory = target_sock_factory
+        self.target_sock = None
 
         # client session fields established via calls to SSHClient.connect() and SSHClient.open_sftp()
         self.proxy_client = None
@@ -317,14 +322,19 @@ class SSHConnection:
 
         for i in range(self.target_attempt_limit):
             logger.info('connect attempt %d of %d', i + 1, self.target_attempt_limit)
+            sock = self.proxy_to_target_channel
+            if sock is None and self.target_sock_factory is not None:
+                sock = self.target_sock_factory()
+                self.target_sock = sock
             try:
                 target_client.connect(hostname=self.target_hostname, port=self.target_port,
                                       username=self.target_username, password=self.target_password,
                                       key_filename=self.target_key_filename,
                                       passphrase=self.target_passphrase, timeout=self.target_timeout,
-                                      sock=self.proxy_to_target_channel)
+                                      sock=sock)
             except Exception as e:
-                logger.info('target_client.connect raised exception', e)
+                logger.info('target_client.connect raised exception: %s', e)
+                self.__close_target_sock()
                 if (i + 1) < self.target_attempt_limit:
                     logger.info('trying again after %f seconds', self.target_retry_delay)
                     time.sleep(self.target_retry_delay)
@@ -336,6 +346,14 @@ class SSHConnection:
                 self.target_client = target_client
                 break
 
+    def __close_target_sock(self):
+        if self.target_sock is not None:
+            try:
+                self.target_sock.close()
+            except Exception as e:
+                logger.debug('closing target sock raised: %s', e)
+            self.target_sock = None
+
     def disconnect(self):
         logger.debug('called')
         if self.target_sftp is not None:
@@ -345,6 +363,8 @@ class SSHConnection:
         if self.target_client is not None:
             self.target_client.close()
             self.target_client = None
+
+        self.__close_target_sock()
 
         if self.proxy_to_target_channel is not None:
             self.proxy_to_target_channel.close()

@@ -1,8 +1,12 @@
+import copy
 import logging
 import os
+import re
 import time
+import uuid
 from textwrap import dedent
 
+import yaml
 from kubernetes import client as client
 from kubernetes.client.rest import ApiException
 
@@ -13,6 +17,147 @@ CDI_VERSION = "v1beta1"
 DATAVOLUME_PLURAL = "datavolumes"
 
 _UNSET_STORAGE_CLASS_VALUES = {"", "none", "null"}
+
+LABEL_PREFIX = "builderdash.omnibond.com"
+LABEL_MANAGED_BY = "app.kubernetes.io/managed-by"
+LABEL_BUILD = f"{LABEL_PREFIX}/build"
+LABEL_RUN_ID = f"{LABEL_PREFIX}/run-id"
+LABEL_IMAGE = f"{LABEL_PREFIX}/image"
+
+INSTANCETYPE_KIND_NAMESPACED = "VirtualMachineInstancetype"
+INSTANCETYPE_KIND_CLUSTER = "VirtualMachineClusterInstancetype"
+PREFERENCE_KIND_NAMESPACED = "VirtualMachinePreference"
+PREFERENCE_KIND_CLUSTER = "VirtualMachineClusterPreference"
+# Default when a KubeVirt build sets neither instancetype nor k8s_resources:
+# a cluster-wide common-instancetypes size (4 vCPU / 16Gi).
+DEFAULT_CLUSTER_INSTANCETYPE = "u1.xlarge"
+
+_INSTANCETYPE_KIND_ALIASES = {
+    "namespaced": INSTANCETYPE_KIND_NAMESPACED,
+    "virtualmachineinstancetype": INSTANCETYPE_KIND_NAMESPACED,
+    "cluster": INSTANCETYPE_KIND_CLUSTER,
+    "virtualmachineclusterinstancetype": INSTANCETYPE_KIND_CLUSTER,
+}
+_PREFERENCE_KIND_ALIASES = {
+    "namespaced": PREFERENCE_KIND_NAMESPACED,
+    "virtualmachinepreference": PREFERENCE_KIND_NAMESPACED,
+    "cluster": PREFERENCE_KIND_CLUSTER,
+    "virtualmachineclusterpreference": PREFERENCE_KIND_CLUSTER,
+}
+_VOLUME_MODES = {"filesystem": "Filesystem", "block": "Block"}
+
+
+def _is_unset(value):
+    return value is None or (isinstance(value, str) and value.strip().lower() in _UNSET_STORAGE_CLASS_VALUES)
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def k8s_label_value(value):
+    """Coerce a string into a valid Kubernetes label value (<=63 chars, alnum at both ends)."""
+    value = re.sub(r"[^A-Za-z0-9._-]", "-", str(value))[:63]
+    return re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", value)
+
+
+def get_build_run_id(my_build):
+    run_id = getattr(my_build, "k8s_build_run_id", None)
+    if _is_unset(run_id):
+        run_id = uuid.uuid4().hex[:12]
+        setattr(my_build, "k8s_build_run_id", run_id)
+    return str(run_id)
+
+
+def get_build_labels(my_build):
+    """Labels put on every Kubernetes object a build creates (VM, VMI/launcher pod, DataVolume/PVC).
+
+    Extra labels can be added with the ``k8s_labels`` mapping.
+    """
+    labels = {
+        LABEL_MANAGED_BY: "builderdash",
+        LABEL_RUN_ID: k8s_label_value(get_build_run_id(my_build)),
+    }
+    build_type = getattr(my_build, "buildtype", None)
+    if not _is_unset(build_type):
+        labels[LABEL_BUILD] = k8s_label_value(build_type)
+    image = getattr(my_build, "instancename", None)
+    if not _is_unset(image):
+        labels[LABEL_IMAGE] = k8s_label_value(image)
+    extra = getattr(my_build, "k8s_labels", None) or {}
+    if not isinstance(extra, dict):
+        raise ValueError("k8s_labels must be a mapping of label keys to values")
+    labels.update({str(k): str(v) for k, v in extra.items()})
+    return {k: v for k, v in labels.items() if v != ""}
+
+
+def get_build_instancetype(my_build):
+    """(kind, name) of the builder VM's instancetype, or None when explicit k8s_resources size it.
+
+    ``instancetype`` set and ``k8s_instancetype_kind`` unset keeps the original
+    namespaced VirtualMachineInstancetype. With ``instancetype`` unset (or null)
+    and no ``k8s_resources``, the default is the cluster-wide common-instancetype
+    ``u1.xlarge``.
+    """
+    name = getattr(my_build, "instancetype", None)
+    kind = getattr(my_build, "k8s_instancetype_kind", None)
+    if _is_unset(name):
+        if getattr(my_build, "k8s_resources", None):
+            return None
+        name = DEFAULT_CLUSTER_INSTANCETYPE
+        default_kind = INSTANCETYPE_KIND_CLUSTER
+    else:
+        default_kind = INSTANCETYPE_KIND_NAMESPACED
+    if _is_unset(kind):
+        kind = default_kind
+    else:
+        resolved = _INSTANCETYPE_KIND_ALIASES.get(str(kind).strip().lower())
+        if resolved is None:
+            raise ValueError(
+                f"k8s_instancetype_kind must be {INSTANCETYPE_KIND_NAMESPACED} or "
+                f"{INSTANCETYPE_KIND_CLUSTER} (or namespaced/cluster); got {kind!r}")
+        kind = resolved
+    return kind, str(name)
+
+
+def get_build_preference(my_build):
+    name = getattr(my_build, "k8s_preference", None)
+    if _is_unset(name):
+        return None
+    kind = getattr(my_build, "k8s_preference_kind", None)
+    if _is_unset(kind):
+        kind = PREFERENCE_KIND_CLUSTER
+    else:
+        resolved = _PREFERENCE_KIND_ALIASES.get(str(kind).strip().lower())
+        if resolved is None:
+            raise ValueError(
+                f"k8s_preference_kind must be {PREFERENCE_KIND_NAMESPACED} or "
+                f"{PREFERENCE_KIND_CLUSTER} (or namespaced/cluster); got {kind!r}")
+        kind = resolved
+    return kind, str(name)
+
+
+def get_build_access_modes(my_build):
+    modes = getattr(my_build, "k8s_access_modes", None)
+    if _is_unset(modes) or modes == []:
+        return ["ReadWriteOnce"]
+    if isinstance(modes, str):
+        modes = [m.strip() for m in modes.split(",") if m.strip()]
+    return [str(m) for m in modes]
+
+
+def get_build_volume_mode(my_build):
+    mode = getattr(my_build, "k8s_volume_mode", None)
+    if _is_unset(mode):
+        return None
+    resolved = _VOLUME_MODES.get(str(mode).strip().lower())
+    if resolved is None:
+        raise ValueError(f"k8s_volume_mode must be Filesystem or Block; got {mode!r}")
+    return resolved
 
 
 def normalize_k8s_storage_class(value):
@@ -56,15 +201,15 @@ vm_template = dedent('''\
     metadata:
       name: {name}
       namespace: {namespace}
-      labels: {labels}
+      labels: {{}}
     spec:
-      running: {instance_state}
+      runStrategy: {run_strategy}
       instancetype:
         kind: {instance_type_kind}
         name: {instance_type_name}
       template:
         metadata:
-          labels: {labels}
+          labels: {{}}
         spec:
           domain:
             devices:
@@ -108,33 +253,106 @@ def generate_vm_template_substitution_dictionary(my_build):
     kubevirt_public_key_openssh = f.read()
     f.close()
 
+    instancetype = get_build_instancetype(my_build)
+    instance_type_kind, instance_type_name = instancetype if instancetype else (None, None)
+
     return {
         'name': my_build.instancename,
         'namespace': my_build.k8s_namespace,
-        'labels': {},  # TODO - support assigning labels
+        'labels': get_build_labels(my_build),
         'instance_state': 'true',
-        'instance_type_kind': 'VirtualMachineInstancetype',
-        'instance_type_name': my_build.instancetype,
+        'run_strategy': 'Always',
+        'instance_type_kind': instance_type_kind,
+        'instance_type_name': instance_type_name,
         'mac_address': 'ee:ee:ee:ee:ee:ee',
         'root_disk_name': 'root-disk',
         'ssh_user': str(my_build.sshkeyuser),
         'public_key_openssh': kubevirt_public_key_openssh,
         'pvc_name': my_build.instancename,
         'pvc_access_mode': 'ReadWriteOnce',
+        'pvc_access_modes': get_build_access_modes(my_build),
+        'pvc_volume_mode': get_build_volume_mode(my_build),
         'pvc_storage_capacity': disksize,
         'data_volume_source': my_build.sourceimage,
         'plain_text_passwd': my_build.kubevirt_plain_text_passwd  # TODO - shall we keep this enabled?
     }
 
 
+def generate_vm_manifest(my_build):
+    """Builder VirtualMachine manifest (dict) with labels, sizing and placement applied.
+
+    Optional build keys: k8s_instancetype_kind, k8s_preference, k8s_preference_kind,
+    k8s_resources ({requests: {...}, limits: {...}}, e.g. ephemeral-storage),
+    k8s_cpu_cores, k8s_affinity, k8s_node_affinity, k8s_node_selector,
+    k8s_tolerations and k8s_labels.
+    """
+    d = generate_vm_template_substitution_dictionary(my_build)
+    manifest = yaml.safe_load(vm_template.format(**d))
+    spec = manifest["spec"]
+    template_spec = spec["template"]["spec"]
+    domain = template_spec["domain"]
+
+    labels = d["labels"]
+    manifest["metadata"]["labels"] = dict(labels)
+    spec["template"]["metadata"]["labels"] = dict(labels)
+
+    if d["instance_type_name"] is None:
+        del spec["instancetype"]
+
+    preference = get_build_preference(my_build)
+    if preference:
+        spec["preference"] = {"kind": preference[0], "name": preference[1]}
+
+    resources = getattr(my_build, "k8s_resources", None)
+    if resources:
+        if not isinstance(resources, dict) or set(resources) - {"requests", "limits"}:
+            raise ValueError("k8s_resources must be a mapping with optional 'requests' and 'limits' mappings")
+        domain["resources"] = copy.deepcopy(resources)
+        cpu_mem = {"cpu", "memory"}
+        sized = set((resources.get("requests") or {})) | set((resources.get("limits") or {}))
+        if d["instance_type_name"] is not None and sized & cpu_mem:
+            logging.warning(
+                "k8s_resources sets cpu/memory while instancetype %s also sizes the VM; KubeVirt may reject "
+                "the VM as conflicting. Set instancetype to null to size the builder with k8s_resources only.",
+                d["instance_type_name"])
+        if d["instance_type_name"] is None and "memory" not in (resources.get("requests") or {}):
+            raise ValueError("k8s_resources.requests.memory is required when no instancetype is used")
+
+    cpu_cores = getattr(my_build, "k8s_cpu_cores", None)
+    if not _is_unset(cpu_cores):
+        domain["cpu"] = {"cores": int(cpu_cores)}
+
+    affinity = getattr(my_build, "k8s_affinity", None)
+    if affinity:
+        template_spec["affinity"] = copy.deepcopy(affinity)
+    node_affinity = getattr(my_build, "k8s_node_affinity", None)
+    if node_affinity:
+        template_spec.setdefault("affinity", {})["nodeAffinity"] = copy.deepcopy(node_affinity)
+    node_selector = getattr(my_build, "k8s_node_selector", None)
+    if node_selector:
+        template_spec["nodeSelector"] = {str(k): str(v) for k, v in node_selector.items()}
+    tolerations = getattr(my_build, "k8s_tolerations", None)
+    if tolerations:
+        if not isinstance(tolerations, list):
+            raise ValueError("k8s_tolerations must be a list of Kubernetes tolerations")
+        template_spec["tolerations"] = copy.deepcopy(tolerations)
+
+    return manifest
+
+
 def generate_rendered_vm_yaml_manifest(my_build):
-    return vm_template.format(**generate_vm_template_substitution_dictionary(my_build))
+    return yaml.safe_dump(generate_vm_manifest(my_build), sort_keys=False)
+
+
+def redact_manifest_for_log(rendered_manifest):
+    """Hide the cloud-init password in a rendered VM manifest before it is logged."""
+    return re.sub(r"(plain_text_passwd:\s*).*", r"\1<redacted>", rendered_manifest)
 
 
 def generate_data_volume_manifest(my_build):
     d = generate_vm_template_substitution_dictionary(my_build)
     pvc_spec = {
-        "accessModes": [d['pvc_access_mode']],
+        "accessModes": list(d['pvc_access_modes']),
         "resources": {
             "requests": {
                 "storage": d['pvc_storage_capacity']
@@ -143,13 +361,18 @@ def generate_data_volume_manifest(my_build):
     }
 
     pvc_spec["storageClassName"] = get_build_k8s_storage_class(my_build)
+    if d['pvc_volume_mode']:
+        pvc_spec["volumeMode"] = d['pvc_volume_mode']
 
+    # Standalone DataVolume: no ownerReferences, so deleting the builder VM leaves
+    # the image DV/PVC Bound and usable (no PV Retain patch needed).
     return {
         "apiVersion": f"{CDI_GROUP}/{CDI_VERSION}",
         "kind": "DataVolume",
         "metadata": {
             "name": d['pvc_name'],
             "namespace": d['namespace'],
+            "labels": dict(d['labels']),
         },
         "spec": {
             "pvc": pvc_spec,
@@ -229,6 +452,26 @@ def get_pvc(client_core_v1_api, namespace, pvc_name):
     except ApiException as e:
         logging.error(f"Exception when reading namespaced PVC '{pvc_name}' from namespace '{namespace}': {e}")
         raise
+
+
+def maybe_patch_pv_to_retain(client_core_v1_api, pv_name):
+    """Opt-in Retain (k8s_retain_root_pv: true). Returns True if patched/already Retain.
+
+    PVs are cluster-scoped, so namespaced accounts get 401/403; that is logged
+    and the build continues, because the image PVC (a standalone DataVolume) is
+    the saved artifact either way.
+    """
+    try:
+        patch_pv_to_retain(client_core_v1_api, pv_name)
+    except ApiException as e:
+        if e.status in (401, 403):
+            logging.warning(
+                "k8s_retain_root_pv is set but this account may not read/patch cluster-scoped PV '%s' "
+                "(HTTP %s); continuing without Retain. The image PVC remains the saved artifact.",
+                pv_name, e.status)
+            return False
+        raise
+    return True
 
 
 def patch_pv_to_retain(client_core_v1_api, pv_name):
@@ -383,8 +626,14 @@ def create_vm_and_wait_for_ip(
         data_volume_manifest,
         timeout=600,          # total budget for running+IP
         interval=10,
-        retain_root_volume=True,
+        retain_root_volume=False,
 ):
+    """Create the image DataVolume and the builder VM, then wait for the VMI IP.
+
+    Returns the IP, or None on failure. Nothing is deleted on failure: the
+    caller stops (halts) the builder VM and keeps the VM and DV/PVC for a dev
+    to inspect.
+    """
     start_time = time.time()
 
     data_volume = create_data_volume(custom_objects_api, k8s_namespace, data_volume_manifest)
@@ -394,7 +643,8 @@ def create_vm_and_wait_for_ip(
 
     vm = create_vm(custom_objects_api, k8s_namespace, manifest)
     if not vm:
-        logging.error('failed create kubevirt VM')
+        logging.error('failed to create kubevirt VM; standalone DataVolume %s/%s is kept',
+                      k8s_namespace, data_volume_manifest['metadata']['name'])
         return None
 
     # ---- 1) Wait for the standalone DataVolume's PVC to bind ----
@@ -416,18 +666,18 @@ def create_vm_and_wait_for_ip(
         logging.error('failed to get bound root PVC')
         return None
 
-    # ---- 2) Retain root volume ----
+    # ---- 2) Optional (opt-in) PV Retain ----
     if retain_root_volume:
         try:
-            patch_pv_to_retain(client_core_v1_api, pvc.spec.volume_name)
+            maybe_patch_pv_to_retain(client_core_v1_api, pvc.spec.volume_name)
         except Exception:
-            logging.exception(
-                "Failed to set retainment on root volume for VM %s; deleting VM", vm_name
-            )
-            delete_vm(custom_objects_api, k8s_namespace, vm_name)
+            logging.exception("Failed to set Retain on the root PV of VM %s; failing the build", vm_name)
             return None
     else:
-        logging.warning("retain_root_volume is False; root volume will be deleted if its PVC is deleted")
+        logging.info(
+            "Not patching PV '%s' to Retain: the image is standalone DataVolume/PVC '%s/%s', which is not "
+            "owned by the builder VM and stays Bound after the VM is deleted.",
+            pvc.spec.volume_name, k8s_namespace, vm_name)
 
     # ---- 3) Wait for VMI to be Running ----
     remaining = timeout - (time.time() - start_time)
@@ -469,6 +719,12 @@ def create_vm_and_wait_for_ip(
 
 
 def stop_vmi(custom_objects_api, k8s_namespace, vmi_name):
+    """Stop (halt) the builder VM without deleting it: runStrategy Halted.
+
+    The VM, its DataVolume and PVC are kept, so it can be started again with
+    ``virtctl start``. ``running: null`` clears the deprecated field on VMs
+    created by older builderdash versions (the two fields are exclusive).
+    """
     try:
         response = custom_objects_api.patch_namespaced_custom_object(
             group='kubevirt.io',
@@ -478,7 +734,8 @@ def stop_vmi(custom_objects_api, k8s_namespace, vmi_name):
             name=vmi_name,
             body={
                 "spec": {
-                    "running": False
+                    "running": None,
+                    "runStrategy": "Halted"
                 }
             }
         )
@@ -488,6 +745,9 @@ def stop_vmi(custom_objects_api, k8s_namespace, vmi_name):
     else:
         logging.info(f'Successfully stopped VMI: {vmi_name}')
         return response
+
+
+stop_vm = stop_vmi
 
 
 def delete_vm(custom_objects_api, k8s_namespace, vm_name):
