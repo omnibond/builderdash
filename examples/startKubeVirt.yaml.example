@@ -6,7 +6,10 @@
   - sshkeyuser: builderdash
   - sshkey: /home/USER/.ssh/kubevirt_ssh_key
   - pubkeypath: /home/USER/.ssh/kubevirt_ssh_key.pub
-  - kubevirt_plain_text_passwd: <builder password>
+  # Optional, development only: a console password for the builder user
+  # (virtctl console testing, or a way in when SSH setup fails). Unset, null
+  # or empty locks the password (SSH key only). Never commit a real one.
+  # - kubevirt_plain_text_passwd: <dev-only console password>
   - cloudservice: kubevirt
   - ostype: almalinux
   - buildtype: control
@@ -47,6 +50,9 @@
     - key: <taint key>
       operator: Exists
       effect: PreferNoSchedule
+  # No guest-console-log sidecar (its default requests/limits are not within
+  # 20% of each other, which NRP rejects). Unset keeps the KubeVirt default.
+  - k8s_log_serial_console: false
 
   # Image disk
   - k8s_storage_class: rook-ceph-block-central

@@ -5,6 +5,8 @@ import time
 
 import paramiko
 
+from builderdash.redaction import redact_mapping
+
 logger = logging.getLogger(__name__)
 
 
@@ -223,7 +225,7 @@ class SSHConnection:
         # proxy_client.load_system_host_keys()
         proxy_client.set_missing_host_key_policy(self.proxy_missing_host_key_policy)
 
-        logger.info('attempting ssh connection via ssh proxy: %s', {
+        logger.info('attempting ssh connection via ssh proxy: %s', redact_mapping({
             'proxy_hostname': self.proxy_hostname,
             'proxy_port': self.proxy_port,
             'proxy_username': self.proxy_username,
@@ -234,7 +236,7 @@ class SSHConnection:
             'proxy_attempt_limit': self.proxy_attempt_limit,
             'proxy_missing_host_key_policy': self.proxy_missing_host_key_policy,
             'proxy_channel_alt_src_hostname': self.proxy_channel_alt_src_hostname
-        })
+        }))
 
         for i in range(self.proxy_attempt_limit):
             logger.debug('connect attempt %d of %d', i+1, self.proxy_attempt_limit)
@@ -308,7 +310,7 @@ class SSHConnection:
         # target_client.load_system_host_keys()
         target_client.set_missing_host_key_policy(self.target_missing_host_key_policy)
 
-        logger.info('attempting ssh connection to target: %s', {
+        logger.info('attempting ssh connection to target: %s', redact_mapping({
             'target_hostname': self.target_hostname,
             'target_port': self.target_port,
             'target_username': self.target_username,
@@ -318,7 +320,7 @@ class SSHConnection:
             'target_timeout': self.target_timeout,
             'target_attempt_limit': self.target_attempt_limit,
             'target_missing_host_key_policy': self.target_missing_host_key_policy
-        })
+        }))
 
         for i in range(self.target_attempt_limit):
             logger.info('connect attempt %d of %d', i + 1, self.target_attempt_limit)

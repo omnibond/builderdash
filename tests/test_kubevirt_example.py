@@ -35,6 +35,11 @@ class KubeVirtExampleTests(unittest.TestCase):
         self.assertEqual(dv["spec"]["pvc"]["storageClassName"], "rook-ceph-block-central")
         self.assertEqual(vm["metadata"]["labels"]["eureka.omnibond.com/build"], "nrp-rel10")
         self.assertEqual(resolve_ssh_transport(build, is_kubevirt=True), "kubectl")
+        self.assertIs(vm["spec"]["template"]["spec"]["domain"]["devices"]["logSerialConsole"], False)
+        self.assertFalse(hasattr(build, "kubevirt_plain_text_passwd"))
+        user_data = vm["spec"]["template"]["spec"]["volumes"][0]["cloudInitNoCloud"]["userData"]
+        self.assertIn("lock_passwd: true", user_data)
+        self.assertNotIn("plain_text_passwd", user_data)
 
 
 if __name__ == "__main__":

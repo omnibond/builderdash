@@ -29,6 +29,7 @@ import paramiko
 import yaml
 import kubernetes
 
+from builderdash.redaction import redact_mapping, redact_value
 from builderdash.kubevirt_operations import (
     LABEL_RUN_ID,
     _as_bool,
@@ -116,9 +117,9 @@ class Build:
             for option in config_section[config_key]:
                 for key in option:
                     name = key
-                    logging.info(f"option = {option}\tname = {name}")
+                    logging.info(f"option = {redact_mapping(option)}\tname = {name}")
                 # TODO What is the purpose of the inner loop above? Is it to determine the last key in the option?
-                logging.info(f"setting attribute on instance of class Build: {name}: {option[name]}")
+                logging.info(f"setting attribute on instance of class Build: {name}: {redact_value(name, option[name])}")
                 if name:
                     setattr(self, name, option[name])
 
@@ -268,7 +269,7 @@ def processInitSection(configSection, myBuild):
                 sys.exit(1)
             else:
                 setattr(myBuild, 'proxy_conf', proxy_conf)
-                logging.info(f'myBuild.proxy_conf: {myBuild.proxy_conf}')
+                logging.info(f'myBuild.proxy_conf: {redact_mapping(myBuild.proxy_conf)}')
         logging.info("instance type is %s", str(getattr(myBuild, 'instancetype', None)))
         launchInstance(myBuild)
         logging.info("remoteIp is %s", str(myBuild.remoteIp))

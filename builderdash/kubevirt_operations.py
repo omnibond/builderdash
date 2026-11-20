@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import os
 import re
@@ -237,8 +238,7 @@ vm_template = dedent('''\
                     groups: sudo
                     shell: /bin/bash
                     sudo: ALL=(ALL) NOPASSWD:ALL
-                    lock_passwd: false
-                    plain_text_passwd: {plain_text_passwd}
+                    {password_lines}
                     ssh_authorized_keys:
                       - {public_key_openssh}
           - name: {root_disk_name}
@@ -274,8 +274,40 @@ def generate_vm_template_substitution_dictionary(my_build):
         'pvc_volume_mode': get_build_volume_mode(my_build),
         'pvc_storage_capacity': disksize,
         'data_volume_source': my_build.sourceimage,
-        'plain_text_passwd': my_build.kubevirt_plain_text_passwd  # TODO - shall we keep this enabled?
+        'password_lines': cloud_init_password_lines(my_build),
     }
+
+
+def get_build_plain_text_passwd(my_build):
+    """The optional dev-only builder password, or None when unset/null/empty."""
+    value = getattr(my_build, "kubevirt_plain_text_passwd", None)
+    if value is None:
+        return None
+    value = str(value)
+    if value.strip() == "" or value.strip().lower() in ("null", "none", "~"):
+        return None
+    return value
+
+
+# Indent of the cloud-init user keys inside vm_template (after dedent).
+_CLOUD_INIT_USER_INDENT = " " * 16
+
+
+def cloud_init_password_lines(my_build):
+    """cloud-init password lines for the builder user.
+
+    Without kubevirt_plain_text_passwd the account is locked (SSH key only).
+    With one, the password is set (JSON-quoted, a valid YAML scalar) for
+    development only: virtctl console access when SSH setup fails.
+    """
+    password = get_build_plain_text_passwd(my_build)
+    if password is None:
+        return "lock_passwd: true"
+    if not getattr(my_build, "_dev_password_warned", False):
+        logging.warning("kubevirt_plain_text_passwd is set: the builder user gets a console password. "
+                        "This is for development only (virtctl console testing); leave it unset otherwise.")
+        setattr(my_build, "_dev_password_warned", True)
+    return f"lock_passwd: false\n{_CLOUD_INIT_USER_INDENT}plain_text_passwd: {json.dumps(password)}"
 
 
 def generate_vm_manifest(my_build):
@@ -284,7 +316,7 @@ def generate_vm_manifest(my_build):
     Optional build keys: k8s_instancetype_kind, k8s_preference, k8s_preference_kind,
     k8s_resources ({requests: {...}, limits: {...}}, e.g. ephemeral-storage),
     k8s_cpu_cores, k8s_affinity, k8s_node_affinity, k8s_node_selector,
-    k8s_tolerations and k8s_labels.
+    k8s_tolerations, k8s_log_serial_console and k8s_labels.
     """
     d = generate_vm_template_substitution_dictionary(my_build)
     manifest = yaml.safe_load(vm_template.format(**d))
@@ -336,6 +368,12 @@ def generate_vm_manifest(my_build):
         if not isinstance(tolerations, list):
             raise ValueError("k8s_tolerations must be a list of Kubernetes tolerations")
         template_spec["tolerations"] = copy.deepcopy(tolerations)
+
+    log_serial_console = getattr(my_build, "k8s_log_serial_console", None)
+    if not _is_unset(log_serial_console):
+        # false drops virt-launcher's guest-console-log sidecar (its default
+        # requests/limits break namespaces that want them within 20%).
+        domain.setdefault("devices", {})["logSerialConsole"] = _as_bool(log_serial_console)
 
     return manifest
 

@@ -105,6 +105,26 @@ and `k8s_kubeconfig_context` are passed to kubectl/virtctl.
 * `k8s_affinity` (full affinity), `k8s_node_affinity` (nodeAffinity
   only), `k8s_node_selector`, `k8s_tolerations`: copied to the VM
   template.
+* `k8s_log_serial_console`: `false` sets
+  `spec.template.spec.domain.devices.logSerialConsole: false`, so
+  virt-launcher has no `guest-console-log` sidecar (useful where every
+  container's requests and limits must be within 20%, e.g. NRP). Unset
+  keeps the KubeVirt default.
+
+### Builder user and password
+
+The builder user (`sshkeyuser`) gets `sshkey`'s public key through
+cloud-init. `kubevirt_plain_text_passwd` is optional and for development
+only (virtctl console testing, or a way in when SSH setup fails):
+
+* unset, `null` or empty: cloud-init sets `lock_passwd: true` and no
+  password (SSH key only). This is the recommended setting.
+* non-empty: cloud-init sets `lock_passwd: false` and that password, and
+  builderdash logs a warning.
+
+Passwords, passphrases and other secret-looking options are logged as
+`<redacted>` (build options, SSH target/proxy parameters, proxy config and
+the rendered VM manifest).
 
 ### DataVolume
 
