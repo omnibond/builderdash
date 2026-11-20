@@ -68,16 +68,48 @@ or 403 then logs a warning and the build continues.
 
 | value | how builderdash reaches the builder's sshd |
 |---|---|
-| `kubectl` | **Default for KubeVirt.** Supervised `kubectl port-forward pod/<virt-launcher> <local>:<build_host_ssh_port>` on 127.0.0.1, restarted if kubectl exits, stopped at the end of the build. Needs `pods/portforward` and `kubectl` on the build host. |
-| `virtctl` | `virtctl port-forward --stdio` as an SSH ProxyCommand. Needs `virtualmachineinstances/portforward` and `virtctl`. |
+| `virtctl` | **Default for KubeVirt.** `virtctl port-forward --stdio=true vmi/<name> <build_host_ssh_port>` as an SSH ProxyCommand, with `k8s_kubeconfig_path`, `k8s_kubeconfig_context` and `k8s_namespace`. Needs `virtualmachineinstances/portforward` and `virtctl` on the build host. |
+| `kubectl` | Opt in for accounts that have only `pods/portforward`. Supervised `kubectl port-forward pod/<virt-launcher> <local>:<build_host_ssh_port>` on 127.0.0.1, restarted if kubectl exits, stopped at the end of the build. Needs `kubectl` on the build host. |
 | `direct` | SSH straight to the VMI pod IP, or to `build_host_ssh_hostname` if set. |
 | `proxy` | Jump host from `proxy_conf_path` (unchanged behavior). |
 
 When `k8s_ssh_transport` is unset, existing configs keep their
 behavior: `proxy_conf_path` selects `proxy`, and
 `build_host_ssh_hostname` selects `direct`. Otherwise KubeVirt builds
-use `kubectl`. The transport and its CLI are checked before anything
-is created in the cluster.
+use `virtctl`. **Behavior change:** the KubeVirt default used to be
+`kubectl`; set `k8s_ssh_transport: kubectl` to keep it. The transport
+and its CLI are checked before anything is created in the cluster; a
+missing virtctl fails the build there, naming `k8s_virtctl_path` and
+`k8s_ssh_transport: kubectl`.
+
+#### `ssh -F` into the builder (`k8s_ssh_config_path`)
+
+With the `virtctl` transport, builderdash writes an OpenSSH config file
+for the build before the VM is created and logs its path. The failed-build
+message repeats it next to the `virtctl start`/`stop` commands, so after
+`virtctl start` a developer can run `ssh -F <file> <alias>`. The alias is
+the builder VM name. Default path: `<working directory>/<VM name>.ssh_config`;
+`k8s_ssh_config_path` sets another (a leading `~` is expanded). Mode 0600.
+Example (placeholder values):
+
+```
+Host builderdash-nrp-rel10-control-20261120-k3x9
+  HostName builderdash-nrp-rel10-control-20261120-k3x9
+  User builderdash
+  IdentityFile /home/USER/.ssh/kubevirt_ssh_key
+  IdentitiesOnly yes
+  ProxyCommand /usr/local/bin/virtctl --kubeconfig /home/USER/.kube/config --context CONTEXT --namespace NAMESPACE port-forward --stdio=true vmi/builderdash-nrp-rel10-control-20261120-k3x9 22
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+```
+
+`IdentityFile` is the configured `sshkey` path; the file never holds key
+material. Host keys are not checked, the same as builderdash itself
+(paramiko `AutoAddPolicy`, nothing saved), because each builder is a new
+VM with new host keys. Arguments in `ProxyCommand` are shell-quoted. The
+file is not written for `kubectl` (its local port exists only while
+builderdash runs), `direct` or `proxy`.
 
 Related keys: `k8s_kubectl_path`, `k8s_virtctl_path`,
 `k8s_ssh_local_port` (default: a free port),

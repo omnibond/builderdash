@@ -8,8 +8,12 @@ from builderdash.ssh_target import resolve_ssh_transport
 
 
 class ResolveSshTransportTests(unittest.TestCase):
-    def test_kubevirt_default_is_kubectl(self):
-        self.assertEqual(resolve_ssh_transport(SimpleNamespace(), is_kubevirt=True), "kubectl")
+    def test_kubevirt_default_is_virtctl(self):
+        self.assertEqual(resolve_ssh_transport(SimpleNamespace(), is_kubevirt=True), "virtctl")
+
+    def test_kubectl_is_still_selectable(self):
+        build = SimpleNamespace(k8s_ssh_transport="kubectl")
+        self.assertEqual(resolve_ssh_transport(build, is_kubevirt=True), "kubectl")
 
     def test_other_providers_default_direct(self):
         self.assertEqual(resolve_ssh_transport(SimpleNamespace(), is_kubevirt=False), "direct")
@@ -32,7 +36,7 @@ class ResolveSshTransportTests(unittest.TestCase):
     def test_null_transport_is_unset(self):
         for value in (None, "", "null"):
             build = SimpleNamespace(k8s_ssh_transport=value)
-            self.assertEqual(resolve_ssh_transport(build, is_kubevirt=True), "kubectl")
+            self.assertEqual(resolve_ssh_transport(build, is_kubevirt=True), "virtctl")
 
     def test_invalid_values(self):
         with self.assertRaises(ValueError):
@@ -60,7 +64,7 @@ class SshConnectTests(unittest.TestCase):
         return SimpleNamespace(**attrs)
 
     def test_kubectl_uses_local_forward(self):
-        self.main.ssh_connect(self.build(k8s_ssh_target=("127.0.0.1", 40022)))
+        self.main.ssh_connect(self.build(k8s_ssh_transport="kubectl", k8s_ssh_target=("127.0.0.1", 40022)))
         kwargs = self.ssh_cls.call_args.kwargs
         self.assertEqual((kwargs["target_hostname"], kwargs["target_port"]), ("127.0.0.1", 40022))
         self.assertIsNone(kwargs["target_sock_factory"])
@@ -93,8 +97,26 @@ class SshConnectTests(unittest.TestCase):
                          "/usr/local/bin/virtctl --kubeconfig /kc --context ctx --namespace omnibond "
                          "port-forward --stdio=true vmi/builderdash-x 22")
 
-    def test_preflight_requires_kubectl(self):
+    def test_default_virtctl_uses_proxy_command(self):
+        self.main.ssh_connect(self.build(k8s_virtctl_bin="/usr/local/bin/virtctl"))
+        kwargs = self.ssh_cls.call_args.kwargs
+        self.assertIsNotNone(kwargs["target_sock_factory"])
+        self.assertEqual(kwargs["target_hostname"], "builderdash-x")
+
+    def test_preflight_default_virtctl_missing_suggests_alternatives(self):
         build = self.build()
+        with mock.patch.object(self.main, "find_binary", return_value=None):
+            with self.assertRaises(ValueError) as caught:
+                self.main.kubevirt_preflight_ssh_transport(build)
+        message = str(caught.exception)
+        self.assertIn("k8s_virtctl_path", message)
+        self.assertIn("k8s_ssh_transport: kubectl", message)
+        with mock.patch.object(self.main, "find_binary", return_value="/usr/local/bin/virtctl"):
+            self.assertEqual(self.main.kubevirt_preflight_ssh_transport(build), "virtctl")
+        self.assertEqual(build.k8s_virtctl_bin, "/usr/local/bin/virtctl")
+
+    def test_preflight_requires_kubectl(self):
+        build = self.build(k8s_ssh_transport="kubectl")
         with mock.patch.object(self.main, "find_binary", return_value=None):
             with self.assertRaises(ValueError):
                 self.main.kubevirt_preflight_ssh_transport(build)

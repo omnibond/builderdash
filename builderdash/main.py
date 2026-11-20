@@ -56,10 +56,12 @@ from builderdash.ssh_target import (
     SSH_TRANSPORT_KUBECTL,
     SSH_TRANSPORT_PROXY,
     SSH_TRANSPORT_VIRTCTL,
+    ssh_transport_is_explicit,
     resolve_ssh_target_hostname,
     resolve_ssh_transport,
 )
 from builderdash.ssher import SSHConnection, load_proxy_conf_file
+from builderdash.ssh_config import ssh_alias, ssh_config_path, ssh_config_text, write_ssh_config
 
 
 @unique
@@ -614,6 +616,7 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
     generate_and_set_instance_name(my_build, my_build.sourceimage)
 
     logging.info('my_build.instancename is: %s', my_build.instancename)
+    kubevirt_write_ssh_config(my_build)
 
     # TODO What should we use for the instanceId with kubevirt?
     my_build.instanceId = None
@@ -674,17 +677,56 @@ def kubevirt_preflight_ssh_transport(my_build):
         kubectl = find_binary(getattr(my_build, 'k8s_kubectl_path', None), 'kubectl')
         if not kubectl:
             raise ValueError(
-                "k8s_ssh_transport is kubectl (the default for kubevirt builds) but kubectl was not found; "
+                "k8s_ssh_transport is kubectl but kubectl was not found; "
                 "install kubectl, set k8s_kubectl_path, or choose k8s_ssh_transport: virtctl|direct|proxy")
         my_build.k8s_kubectl_bin = kubectl
     elif transport == SSH_TRANSPORT_VIRTCTL:
         virtctl = find_binary(getattr(my_build, 'k8s_virtctl_path', None), 'virtctl')
         if not virtctl:
-            raise ValueError("k8s_ssh_transport is virtctl but virtctl was not found; "
-                             "install virtctl or set k8s_virtctl_path")
+            if ssh_transport_is_explicit(my_build):
+                raise ValueError("k8s_ssh_transport is virtctl but virtctl was not found; "
+                                 "install virtctl or set k8s_virtctl_path")
+            raise ValueError(
+                "virtctl was not found. KubeVirt builds reach the builder through "
+                "`virtctl port-forward --stdio` by default (needs virtualmachineinstances/portforward). "
+                "Install virtctl or set k8s_virtctl_path, or set k8s_ssh_transport: kubectl "
+                "(kubectl port-forward to the virt-launcher pod, needs only pods/portforward)")
         my_build.k8s_virtctl_bin = virtctl
     logging.info('kubevirt build SSH transport: %s', transport)
     return transport
+
+
+def kubevirt_virtctl_proxy_argv(my_build, remote_port=None):
+    """virtctl port-forward --stdio argv for this build (kubeconfig, context, namespace)."""
+    if remote_port is None:
+        remote_port = getattr(my_build, 'build_host_ssh_port', 22) or 22
+    return virtctl_proxy_command(
+        getattr(my_build, 'k8s_virtctl_bin', None) or 'virtctl', my_build.k8s_namespace, my_build.instancename,
+        remote_port, getattr(my_build, 'k8s_kubeconfig_path', None), getattr(my_build, 'k8s_kubeconfig_context', None))
+
+
+def kubevirt_write_ssh_config(my_build):
+    """With the virtctl transport, write an OpenSSH config for `ssh -F <file> <alias>`.
+
+    Not written for kubectl (its local port is only valid while builderdash
+    runs), direct or proxy. A write error is a warning; the build goes on.
+    """
+    my_build.k8s_ssh_config_file = None
+    if getattr(my_build, 'k8s_ssh_transport_resolved', None) != SSH_TRANSPORT_VIRTCTL:
+        return None
+    path = ssh_config_path(my_build)
+    text = ssh_config_text(
+        ssh_alias(my_build), my_build.sshkeyuser, getattr(my_build, 'sshkey', None),
+        kubevirt_virtctl_proxy_argv(my_build),
+        note=f"builder VM {my_build.k8s_namespace}/{my_build.instancename}")
+    try:
+        write_ssh_config(path, text)
+    except OSError as e:
+        logging.warning('could not write the builder ssh config %s: %s', path, e)
+        return None
+    my_build.k8s_ssh_config_file = path
+    logging.info('builder ssh config: %s  (ssh -F %s %s)', path, shlex.quote(path), ssh_alias(my_build))
+    return path
 
 
 def kubevirt_start_port_forward(my_build):
@@ -735,21 +777,38 @@ def kubevirt_kubectl_prefix(my_build):
     return ' '.join(shlex.quote(a) for a in args)
 
 
+def kubevirt_virtctl_prefix(my_build):
+    args = [getattr(my_build, 'k8s_virtctl_bin', None) or 'virtctl']
+    if getattr(my_build, 'k8s_kubeconfig_path', None):
+        args += ['--kubeconfig', os.path.expanduser(str(my_build.k8s_kubeconfig_path))]
+    if getattr(my_build, 'k8s_kubeconfig_context', None):
+        args += ['--context', str(my_build.k8s_kubeconfig_context)]
+    args += ['-n', str(my_build.k8s_namespace)]
+    return ' '.join(shlex.quote(a) for a in args)
+
+
 def kubevirt_failed_build_help(my_build, vm_halted):
     ns = my_build.k8s_namespace
     name = my_build.instancename
     kubectl = kubevirt_kubectl_prefix(my_build)
+    virtctl = kubevirt_virtctl_prefix(my_build)
+    ssh_config_file = getattr(my_build, 'k8s_ssh_config_file', None)
     run_id = getattr(my_build, 'k8s_build_run_id', None)
     state = 'stopped (runStrategy: Halted)' if vm_halted else 'not running or could not be stopped (check it)'
     lines = [
         'KubeVirt build FAILED. Nothing was deleted; cleanup is up to you.',
         f'  builder VM:          {ns}/{name} ({state})',
         f'  image DataVolume/PVC: {ns}/{name} (kept)',
-        f'  start it again:      virtctl start {shlex.quote(name)} -n {shlex.quote(ns)}'
+        f'  start it again:      {virtctl} start {shlex.quote(name)}'
         f"   (or: {kubectl} patch vm {shlex.quote(name)} --type merge -p '{{\"spec\":{{\"runStrategy\":\"Always\"}}}}')",
+    ]
+    if ssh_config_file:
+        lines.append(f'  ssh into it:         ssh -F {shlex.quote(ssh_config_file)} {ssh_alias(my_build)}'
+                     '   (after it is running again)')
+    lines += [
         f'  reach its sshd:      {kubectl} port-forward pod/<virt-launcher-pod> 2222:22'
         f'   (pod: {kubectl} get pod -l vm.kubevirt.io/name={name})',
-        f'  stop it again:       virtctl stop {shlex.quote(name)} -n {shlex.quote(ns)}',
+        f'  stop it again:       {virtctl} stop {shlex.quote(name)}',
         f'  clean up by hand:    {kubectl} delete vm {shlex.quote(name)} && {kubectl} delete dv {shlex.quote(name)}',
     ]
     if run_id:
@@ -899,10 +958,7 @@ def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
     if transport == SSH_TRANSPORT_KUBECTL:
         target_hostname, target_port = myBuild.k8s_ssh_target
     elif transport == SSH_TRANSPORT_VIRTCTL:
-        virtctl = getattr(myBuild, 'k8s_virtctl_bin', None) or 'virtctl'
-        proxy_command = ' '.join(shlex.quote(a) for a in virtctl_proxy_command(
-            virtctl, myBuild.k8s_namespace, myBuild.instancename, target_port,
-            getattr(myBuild, 'k8s_kubeconfig_path', None), getattr(myBuild, 'k8s_kubeconfig_context', None)))
+        proxy_command = ' '.join(shlex.quote(a) for a in kubevirt_virtctl_proxy_argv(myBuild, target_port))
         logging.info('ssh ProxyCommand: %s', proxy_command)
         sock_factory = lambda: paramiko.ProxyCommand(proxy_command)
         target_hostname = myBuild.instancename

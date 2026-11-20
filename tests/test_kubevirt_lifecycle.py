@@ -163,11 +163,18 @@ class FailedBuildHandlingTests(unittest.TestCase):
         text = "\n".join(logs.output)
         name = self.build.instancename
         self.assertIn(f"builder VM:          omnibond/{name} (stopped (runStrategy: Halted))", text)
-        self.assertIn(f"virtctl start {name} -n omnibond", text)
+        self.assertIn(f"-n omnibond start {name}", text)
+        self.assertIn(f"-n omnibond stop {name}", text)
+        self.assertNotIn("ssh -F", text)  # no config file written for this build
         self.assertIn(f"delete vm {name}", text)
         self.assertIn(f"delete dv {name}", text)
         self.assertIn("--context nautilus", text)
         self.assertIn("builderdash.omnibond.com/run-id=run123", text)
+
+    def test_failed_build_help_names_the_ssh_config(self):
+        self.build.k8s_ssh_config_file = "/work/builderdash-x.ssh_config"
+        text = self.main.kubevirt_failed_build_help(self.build, vm_halted=True)
+        self.assertIn(f"ssh -F /work/builderdash-x.ssh_config {self.build.instancename}", text)
 
     def test_failure_handling_is_idempotent(self):
         with mock.patch.object(self.main, "get_vm", return_value={"metadata": {}}), self.assertLogs(level=logging.ERROR):

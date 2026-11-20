@@ -28,8 +28,9 @@ def resolve_ssh_transport(my_build, is_kubevirt):
     is unset, existing configs keep their behavior: a ``proxy_conf_path`` means
     ``proxy`` (jump host) and a ``build_host_ssh_hostname`` override means
     ``direct`` (the caller runs its own forward). Otherwise KubeVirt builds use
-    ``kubectl`` (port-forward to the virt-launcher pod) and other providers use
-    ``direct``.
+    ``virtctl`` (``virtctl port-forward --stdio`` as a ProxyCommand) and other
+    providers use ``direct``. ``kubectl`` (port-forward to the virt-launcher
+    pod, for accounts with only ``pods/portforward``) must be chosen explicitly.
     """
     transport = getattr(my_build, "k8s_ssh_transport", None)
     if transport not in _UNSET:
@@ -46,4 +47,8 @@ def resolve_ssh_transport(my_build, is_kubevirt):
         return SSH_TRANSPORT_PROXY
     if getattr(my_build, "build_host_ssh_hostname", None) not in _UNSET:
         return SSH_TRANSPORT_DIRECT
-    return SSH_TRANSPORT_KUBECTL if is_kubevirt else SSH_TRANSPORT_DIRECT
+    return SSH_TRANSPORT_VIRTCTL if is_kubevirt else SSH_TRANSPORT_DIRECT
+
+
+def ssh_transport_is_explicit(my_build):
+    return getattr(my_build, "k8s_ssh_transport", None) not in _UNSET

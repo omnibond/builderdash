@@ -25,9 +25,15 @@
   - k8s_kubeconfig_context: nautilus-omnibond
   - k8s_namespace: omnibond
 
-  # SSH: kubectl port-forward to the virt-launcher pod (default for kubevirt)
-  - k8s_ssh_transport: kubectl
+  # SSH: virtctl port-forward --stdio as a ProxyCommand (the default for
+  # kubevirt; needs virtualmachineinstances/portforward). Accounts with only
+  # pods/portforward set k8s_ssh_transport: kubectl instead.
+  - k8s_ssh_transport: virtctl
+  # - k8s_virtctl_path: /usr/local/bin/virtctl
   - build_host_ssh_port: 22
+  # OpenSSH config for `ssh -F <file> <alias>` into the builder (virtctl only).
+  # Default: <working dir>/<builder VM name>.ssh_config, mode 0600.
+  # - k8s_ssh_config_path: ~/builderdash/nrp-rel10.ssh_config
 
   # Size: cluster-wide common-instancetype (u1.2xlarge also works)
   - instancetype: u1.xlarge
