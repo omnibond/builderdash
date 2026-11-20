@@ -40,6 +40,10 @@ class KubeVirtExampleTests(unittest.TestCase):
         user_data = vm["spec"]["template"]["spec"]["volumes"][0]["cloudInitNoCloud"]["userData"]
         self.assertIn("lock_passwd: true", user_data)
         self.assertNotIn("plain_text_passwd", user_data)
+        # k8s_annotations is commented out in the example: no annotations anywhere.
+        self.assertNotIn("annotations", vm["metadata"])
+        self.assertNotIn("annotations", vm["spec"]["template"]["metadata"])
+        self.assertNotIn("annotations", dv["metadata"])
 
 
 if __name__ == "__main__":

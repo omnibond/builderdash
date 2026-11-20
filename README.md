@@ -47,6 +47,7 @@ Both carry the labels `app.kubernetes.io/managed-by=builderdash`,
 `builderdash.omnibond.com/run-id=<run id>` and
 `builderdash.omnibond.com/image=<instancename>`, plus any `k8s_labels`.
 The VM template labels also land on the VMI and virt-launcher pod.
+Annotations are optional; see [Annotations](#annotations-k8s_annotations).
 
 **Success:** `deleteinstance` deletes the builder VM only; the
 DataVolume/PVC is the saved image.
@@ -163,6 +164,50 @@ the rendered VM manifest).
 * `k8s_storage_class` (required, as before)
 * `k8s_access_modes` (default `[ReadWriteOnce]`)
 * `k8s_volume_mode` (`Filesystem` or `Block`; default: the cluster's)
+
+### Annotations (`k8s_annotations`)
+
+Optional. A mapping keyed by the kind of Kubernetes object builderdash
+creates directly, each value a mapping of annotation keys to string values:
+
+| Kind key | Where it goes |
+| --- | --- |
+| `all` | every kind below (merged under the per-kind entries) |
+| `datavolume` | the image DataVolume's `metadata.annotations` (CDI copies most DataVolume annotations to the PVC it creates) |
+| `virtualmachine` | the builder VirtualMachine's `metadata.annotations` |
+| `vmi` | `spec.template.metadata.annotations`, which KubeVirt puts on the VMI and the virt-launcher pod |
+| `service` | the headless subdomain Service helper (`create_subdomain_headless_service`); the build flow creates no Service today |
+
+Builderdash creates no Secrets or ConfigMaps (cloud-init user data is
+inline in the VM), so there are no keys for them.
+
+```yaml
+- k8s_annotations:
+    all:
+      eureka.omnibond.com/owner: jdenton
+    datavolume:
+      cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+    vmi:
+      example.com/launcher-note: builder
+```
+
+* **Unset** (or empty, or kinds with empty maps): no `annotations` field is
+  added, so manifests are exactly as before.
+* **Precedence:** `all` < per-kind entry < annotations builderdash itself
+  requires. Builderdash requires none today; if it ever does and a caller
+  sets a different value, the builderdash value is used and a warning
+  names the key (never the value).
+* **Aliases:** kind keys are case-insensitive; `common`, `dv`, `vm`,
+  `virtualmachineinstance` and `svc` are accepted. Unknown kinds, or the
+  same kind given twice through an alias, fail the build before anything is
+  created.
+* **Validation:** keys must be valid Kubernetes annotation keys
+  (`[prefix/]name`), and values must be strings, so quote YAML booleans and
+  numbers (`"true"`, `"5"`). A bad value is reported by key and type, not
+  echoed.
+* Annotations appear in the rendered manifests that builderdash logs (the
+  same logging and redaction as the rest of the manifest) and are readable
+  by anyone who can read the objects. Don't put secrets in them.
 
 See `examples/startKubeVirt.yaml.example`.
 

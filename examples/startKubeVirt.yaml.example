@@ -69,6 +69,21 @@
   - k8s_labels:
       eureka.omnibond.com/build: nrp-rel10
 
+  # Optional annotations, keyed by the kind of object builderdash creates:
+  # all (every kind), datavolume, virtualmachine, vmi (VM template ->
+  # VMI and virt-launcher pod), service. Per-kind values win over all;
+  # annotations builderdash itself requires win over both. Keys and values
+  # must be strings (quote "true" and numbers). Unset adds no annotations.
+  # Annotations are logged with the rendered manifests and readable in the
+  # cluster: never put secrets in them.
+  # - k8s_annotations:
+  #     all:
+  #       eureka.omnibond.com/owner: <owner>
+  #     datavolume:
+  #       cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+  #     vmi:
+  #       <annotation key>: <value>
+
 - build:
   - builderdash:
     - build.yaml

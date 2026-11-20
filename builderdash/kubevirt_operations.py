@@ -96,6 +96,110 @@ def get_build_labels(my_build):
     return {k: v for k, v in labels.items() if v != ""}
 
 
+# k8s_annotations: optional caller annotations, keyed by the kind of object
+# builderdash creates. ``all`` applies to every kind; a per-kind entry wins
+# over ``all`` for the same key; annotations builderdash itself sets win over
+# both (a conflict is logged with the key only, never the value).
+ANNOTATION_KIND_ALL = "all"
+ANNOTATION_KIND_DATAVOLUME = "datavolume"
+ANNOTATION_KIND_VIRTUALMACHINE = "virtualmachine"
+ANNOTATION_KIND_VMI = "vmi"
+ANNOTATION_KIND_SERVICE = "service"
+ANNOTATION_KINDS = (
+    ANNOTATION_KIND_DATAVOLUME,
+    ANNOTATION_KIND_VIRTUALMACHINE,
+    ANNOTATION_KIND_VMI,
+    ANNOTATION_KIND_SERVICE,
+)
+_ANNOTATION_KIND_ALIASES = {
+    "all": ANNOTATION_KIND_ALL,
+    "common": ANNOTATION_KIND_ALL,
+    "datavolume": ANNOTATION_KIND_DATAVOLUME,
+    "dv": ANNOTATION_KIND_DATAVOLUME,
+    "virtualmachine": ANNOTATION_KIND_VIRTUALMACHINE,
+    "vm": ANNOTATION_KIND_VIRTUALMACHINE,
+    "vmi": ANNOTATION_KIND_VMI,
+    "virtualmachineinstance": ANNOTATION_KIND_VMI,
+    "service": ANNOTATION_KIND_SERVICE,
+    "svc": ANNOTATION_KIND_SERVICE,
+}
+# Annotations builderdash itself requires, per kind. None today; kept so a
+# future required annotation always wins over caller values.
+BUILDERDASH_ANNOTATIONS = {kind: {} for kind in ANNOTATION_KINDS}
+
+_ANNOTATION_NAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$")
+_ANNOTATION_PREFIX_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+
+
+def _validate_annotation_key(key, where):
+    if not isinstance(key, str) or not key:
+        raise ValueError(f"{where}: annotation keys must be non-empty strings; got {key!r}")
+    prefix, _, name = key.rpartition("/")
+    if (not _ANNOTATION_NAME_RE.match(name)
+            or (prefix and (len(prefix) > 253 or not _ANNOTATION_PREFIX_RE.match(prefix)))):
+        raise ValueError(f"{where}: {key!r} is not a valid Kubernetes annotation key "
+                         "([prefix/]name, name <= 63 chars, prefix a DNS subdomain)")
+
+
+def _validate_annotation_map(value, where):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} must be a mapping of annotation keys to string values")
+    for key, val in value.items():
+        _validate_annotation_key(key, where)
+        if not isinstance(val, str):
+            # Values are not echoed: they may be sensitive.
+            raise ValueError(f"{where}: the value of annotation {key!r} must be a string "
+                             f"(got {type(val).__name__}); quote it in YAML")
+    return dict(value)
+
+
+def get_build_annotation_config(my_build):
+    """Validated ``k8s_annotations`` as {kind: {key: value}} (canonical kind names), or {} when unset."""
+    config = getattr(my_build, "k8s_annotations", None)
+    if config is None or config == {}:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError("k8s_annotations must be a mapping keyed by resource kind "
+                         f"({ANNOTATION_KIND_ALL}, {', '.join(ANNOTATION_KINDS)})")
+    resolved = {}
+    for raw_kind, annotations in config.items():
+        kind = _ANNOTATION_KIND_ALIASES.get(str(raw_kind).strip().lower())
+        if kind is None:
+            raise ValueError(f"k8s_annotations: unknown resource kind {raw_kind!r}; expected one of "
+                             f"{ANNOTATION_KIND_ALL}, {', '.join(ANNOTATION_KINDS)}")
+        if kind in resolved:
+            raise ValueError(f"k8s_annotations: resource kind {kind!r} is given more than once")
+        resolved[kind] = _validate_annotation_map(annotations, f"k8s_annotations.{raw_kind}")
+    return resolved
+
+
+def get_build_annotations(my_build, kind):
+    """Annotations for one kind of object builderdash creates: all < per-kind < builderdash-required.
+
+    Returns {} when nothing applies, so callers can leave ``annotations`` out of
+    the manifest entirely (unset config renders exactly as before).
+    """
+    if kind not in ANNOTATION_KINDS:
+        raise ValueError(f"unknown annotation resource kind {kind!r}")
+    config = get_build_annotation_config(my_build)
+    merged = dict(config.get(ANNOTATION_KIND_ALL, {}))
+    merged.update(config.get(kind, {}))
+    for key, value in BUILDERDASH_ANNOTATIONS.get(kind, {}).items():
+        if key in merged and merged[key] != value:
+            logging.warning("k8s_annotations sets %s on the %s, which builderdash manages; "
+                            "the builderdash value is used", key, kind)
+        merged[key] = value
+    return merged
+
+
+def _apply_annotations(metadata, annotations):
+    if annotations:
+        metadata["annotations"] = dict(annotations)
+
+
 def get_build_instancetype(my_build):
     """(kind, name) of the builder VM's instancetype, or None when explicit k8s_resources size it.
 
@@ -316,7 +420,8 @@ def generate_vm_manifest(my_build):
     Optional build keys: k8s_instancetype_kind, k8s_preference, k8s_preference_kind,
     k8s_resources ({requests: {...}, limits: {...}}, e.g. ephemeral-storage),
     k8s_cpu_cores, k8s_affinity, k8s_node_affinity, k8s_node_selector,
-    k8s_tolerations, k8s_log_serial_console and k8s_labels.
+    k8s_tolerations, k8s_log_serial_console, k8s_labels and k8s_annotations
+    (virtualmachine -> VM metadata, vmi -> VMI template metadata).
     """
     d = generate_vm_template_substitution_dictionary(my_build)
     manifest = yaml.safe_load(vm_template.format(**d))
@@ -327,6 +432,8 @@ def generate_vm_manifest(my_build):
     labels = d["labels"]
     manifest["metadata"]["labels"] = dict(labels)
     spec["template"]["metadata"]["labels"] = dict(labels)
+    _apply_annotations(manifest["metadata"], get_build_annotations(my_build, ANNOTATION_KIND_VIRTUALMACHINE))
+    _apply_annotations(spec["template"]["metadata"], get_build_annotations(my_build, ANNOTATION_KIND_VMI))
 
     if d["instance_type_name"] is None:
         del spec["instancetype"]
@@ -404,14 +511,16 @@ def generate_data_volume_manifest(my_build):
 
     # Standalone DataVolume: no ownerReferences, so deleting the builder VM leaves
     # the image DV/PVC Bound and usable (no PV Retain patch needed).
+    metadata = {
+        "name": d['pvc_name'],
+        "namespace": d['namespace'],
+        "labels": dict(d['labels']),
+    }
+    _apply_annotations(metadata, get_build_annotations(my_build, ANNOTATION_KIND_DATAVOLUME))
     return {
         "apiVersion": f"{CDI_GROUP}/{CDI_VERSION}",
         "kind": "DataVolume",
-        "metadata": {
-            "name": d['pvc_name'],
-            "namespace": d['namespace'],
-            "labels": dict(d['labels']),
-        },
+        "metadata": metadata,
         "spec": {
             "pvc": pvc_spec,
             "source": d['data_volume_source'],
@@ -806,12 +915,15 @@ def delete_vm(custom_objects_api, k8s_namespace, vm_name):
         raise
 
 
-def create_subdomain_headless_service(client_core_v1_api, namespace, subdomain):
-    # Define the service
+def create_subdomain_headless_service(client_core_v1_api, namespace, subdomain, annotations=None):
+    """Headless Service for a VMI subdomain (not used by the build flow today).
+
+    ``annotations``: e.g. ``get_build_annotations(my_build, "service")``; None/{} adds none.
+    """
     service = client.V1Service(
         api_version="v1",
         kind="Service",
-        metadata=client.V1ObjectMeta(name=subdomain),
+        metadata=client.V1ObjectMeta(name=subdomain, annotations=dict(annotations) if annotations else None),
         spec=client.V1ServiceSpec(
             selector={"expose": subdomain},
             cluster_ip="None"
