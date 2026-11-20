@@ -21,6 +21,17 @@ documentation for the provider's Python cloud library).
 
 Then run `builderdash -c startCLOUD.yaml` to start the build.
 
+Optional start-YAML key `build_host_ssh_hostname` overrides the SSH
+target (default is the instance `remoteIp`). Unset keeps GCE/AWS and
+KubeVirt-on-GCE unchanged. This is a destination replace, not
+`proxy_conf` (that remains a jump). Pair it with existing
+`build_host_ssh_port`. Example for a localhost port-forward:
+
+```
+  - build_host_ssh_hostname: 127.0.0.1
+  - build_host_ssh_port: 2222
+```
+
 Instructions for launching the generated image are available at
 http://docs.aws.cloudycluster.com/software/add-sw-custom-ami/ or
 https://docs.gcp.cloudycluster.com/software/add-sw-custom-image/.

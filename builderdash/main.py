@@ -35,6 +35,7 @@ from builderdash.kubevirt_operations import (
     get_pvc,
     stop_vmi,
 )
+from builderdash.ssh_target import resolve_ssh_target_hostname
 from builderdash.ssher import SSHConnection, load_proxy_conf_file
 
 
@@ -738,9 +739,11 @@ def processSection(configSection, ssh, myBuild):
 
 def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
     logging.info('ssh_connect called')
+    target_hostname = resolve_ssh_target_hostname(myBuild)
+    logging.info('ssh target hostname is %s (remoteIp %s)', target_hostname, myBuild.remoteIp)
     # TODO clean up variable names below
     if hasattr(myBuild, 'proxy_conf'):
-        ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
+        ssh = SSHConnection(target_hostname=target_hostname, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
                             target_timeout=timeout, target_attempt_limit=attempt_limit, target_retry_delay=retry_delay,
                             target_missing_host_key_policy=paramiko.AutoAddPolicy(),
@@ -754,7 +757,7 @@ def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
                             proxy_missing_host_key_policy=myBuild.proxy_conf['proxy_missing_host_key_policy'],
                             proxy_channel_alt_src_hostname=myBuild.proxy_conf['proxy_channel_alt_src_hostname'])
     else:
-        ssh = SSHConnection(target_hostname=myBuild.remoteIp, target_port=myBuild.build_host_ssh_port,
+        ssh = SSHConnection(target_hostname=target_hostname, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
                             target_timeout=timeout, target_attempt_limit=attempt_limit,
                             target_missing_host_key_policy=paramiko.AutoAddPolicy())
