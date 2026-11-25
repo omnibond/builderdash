@@ -1,0 +1,89 @@
+# KubeVirt build on a namespaced account (for example NRP Nautilus).
+# Copy to startKubeVirt.yaml and adjust. Placeholder values are in <>.
+- start:
+  - local: false
+  - sshkeyname: builderdash
+  - sshkeyuser: builderdash
+  - sshkey: /home/USER/.ssh/kubevirt_ssh_key
+  - pubkeypath: /home/USER/.ssh/kubevirt_ssh_key.pub
+  # Optional, development only: a console password for the builder user
+  # (virtctl console testing, or a way in when SSH setup fails). Unset, null
+  # or empty locks the password (SSH key only). Never commit a real one.
+  # - kubevirt_plain_text_passwd: <dev-only console password>
+  - cloudservice: kubevirt
+  - ostype: almalinux
+  - buildtype: control
+  - instancename: nrp-rel10
+  - addhash: false
+  - disksize: 35Gi
+  - sourceimage:
+      http:
+        url: <https URL of the base qcow2>
+
+  # Cluster access
+  - k8s_kubeconfig_path: ~/.kube/nrp-omnibond.kubeconfig
+  - k8s_kubeconfig_context: nautilus-omnibond
+  - k8s_namespace: omnibond
+
+  # SSH: virtctl port-forward --stdio as a ProxyCommand (the default for
+  # kubevirt; needs virtualmachineinstances/portforward). Accounts with only
+  # pods/portforward set k8s_ssh_transport: kubectl instead.
+  - k8s_ssh_transport: virtctl
+  # - k8s_virtctl_path: /usr/local/bin/virtctl
+  - build_host_ssh_port: 22
+  # OpenSSH config for `ssh -F <file> <alias>` into the builder (virtctl only).
+  # Default: <working dir>/<builder VM name>.ssh_config, mode 0600.
+  # - k8s_ssh_config_path: ~/builderdash/nrp-rel10.ssh_config
+
+  # Size: cluster-wide common-instancetype (u1.2xlarge also works)
+  - instancetype: u1.xlarge
+  - k8s_instancetype_kind: VirtualMachineClusterInstancetype
+  - k8s_resources:
+      requests:
+        ephemeral-storage: 5Gi
+      limits:
+        ephemeral-storage: 5Gi
+
+  # Placement
+  - k8s_node_affinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values: [<approved node hostnames>]
+  - k8s_tolerations:
+    - key: <taint key>
+      operator: Exists
+      effect: PreferNoSchedule
+  # No guest-console-log sidecar (its default requests/limits are not within
+  # 20% of each other, which NRP rejects). Unset keeps the KubeVirt default.
+  - k8s_log_serial_console: false
+
+  # Image disk
+  - k8s_storage_class: rook-ceph-block-central
+  - k8s_access_modes: [ReadWriteOnce]
+  - k8s_volume_mode: Filesystem
+
+  # Extra labels (builderdash adds build, run-id and image labels itself)
+  - k8s_labels:
+      eureka.omnibond.com/build: nrp-rel10
+
+  # Optional annotations, keyed by the kind of object builderdash creates:
+  # all (every kind), datavolume, virtualmachine, vmi (VM template ->
+  # VMI and virt-launcher pod), service. Per-kind values win over all;
+  # annotations builderdash itself requires win over both. Keys and values
+  # must be strings (quote "true" and numbers). Unset adds no annotations.
+  # Annotations are logged with the rendered manifests and readable in the
+  # cluster: never put secrets in them.
+  # - k8s_annotations:
+  #     all:
+  #       eureka.omnibond.com/owner: <owner>
+  #     datavolume:
+  #       cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+  #     vmi:
+  #       <annotation key>: <value>
+
+- build:
+  - builderdash:
+    - build.yaml

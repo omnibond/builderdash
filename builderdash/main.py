@@ -6,6 +6,7 @@
 from __future__ import annotations
 import argparse
 import ast
+import atexit
 import configparser
 import datetime
 import json
@@ -14,6 +15,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -27,16 +29,39 @@ import paramiko
 import yaml
 import kubernetes
 
+from builderdash.redaction import redact_mapping, redact_value
 from builderdash.kubevirt_operations import (
+    LABEL_RUN_ID,
+    _as_bool,
     create_vm_and_wait_for_ip,
     delete_vm,
     generate_data_volume_manifest,
     generate_rendered_vm_yaml_manifest,
+    get_build_run_id,
     get_pvc,
+    get_vm,
+    get_vmi,
+    redact_manifest_for_log,
     stop_vmi,
 )
-from builderdash.ssh_target import resolve_ssh_target_hostname
+from builderdash.kubevirt_port_forward import (
+    PortForward,
+    find_binary,
+    find_launcher_pod,
+    kubectl_base_args,
+    virtctl_proxy_command,
+    wait_for_launcher_pod,
+)
+from builderdash.ssh_target import (
+    SSH_TRANSPORT_KUBECTL,
+    SSH_TRANSPORT_PROXY,
+    SSH_TRANSPORT_VIRTCTL,
+    ssh_transport_is_explicit,
+    resolve_ssh_target_hostname,
+    resolve_ssh_transport,
+)
 from builderdash.ssher import SSHConnection, load_proxy_conf_file
+from builderdash.ssh_config import ssh_alias, ssh_config_path, ssh_config_text, write_ssh_config
 
 
 @unique
@@ -94,9 +119,9 @@ class Build:
             for option in config_section[config_key]:
                 for key in option:
                     name = key
-                    logging.info(f"option = {option}\tname = {name}")
+                    logging.info(f"option = {redact_mapping(option)}\tname = {name}")
                 # TODO What is the purpose of the inner loop above? Is it to determine the last key in the option?
-                logging.info(f"setting attribute on instance of class Build: {name}: {option[name]}")
+                logging.info(f"setting attribute on instance of class Build: {name}: {redact_value(name, option[name])}")
                 if name:
                     setattr(self, name, option[name])
 
@@ -246,8 +271,8 @@ def processInitSection(configSection, myBuild):
                 sys.exit(1)
             else:
                 setattr(myBuild, 'proxy_conf', proxy_conf)
-                logging.info(f'myBuild.proxy_conf: {myBuild.proxy_conf}')
-        logging.info("instance type is %s", str(myBuild.instancetype))
+                logging.info(f'myBuild.proxy_conf: {redact_mapping(myBuild.proxy_conf)}')
+        logging.info("instance type is %s", str(getattr(myBuild, 'instancetype', None)))
         launchInstance(myBuild)
         logging.info("remoteIp is %s", str(myBuild.remoteIp))
 
@@ -580,21 +605,31 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
     logging.info(f"k8s_custom_objects_api is: {my_build.k8s_custom_objects_api}")
     logging.info(f"Source image is:\n# BEGIN\n{json.dumps(my_build.sourceimage, indent=4)}\n# END")
 
+    # Preflight the SSH transport before anything is created in the cluster.
+    try:
+        kubevirt_preflight_ssh_transport(my_build)
+    except ValueError as e:
+        logging.error(str(e))
+        sys.exit(1)
+    get_build_run_id(my_build)
+
     generate_and_set_instance_name(my_build, my_build.sourceimage)
 
     logging.info('my_build.instancename is: %s', my_build.instancename)
+    kubevirt_write_ssh_config(my_build)
 
     # TODO What should we use for the instanceId with kubevirt?
     my_build.instanceId = None
 
-    rendered_manifest = generate_rendered_vm_yaml_manifest(my_build)
     try:
+        rendered_manifest = generate_rendered_vm_yaml_manifest(my_build)
         data_volume_manifest = generate_data_volume_manifest(my_build)
     except ValueError as e:
         logging.error(str(e))
         sys.exit(1)
 
-    logging.info(f'Rendered kubevirt VM instance yaml manifest:\n# BEGIN\n{rendered_manifest}\n# END')
+    logging.info('Rendered kubevirt VM instance yaml manifest:\n# BEGIN\n%s\n# END',
+                 redact_manifest_for_log(rendered_manifest))
     logging.info(
         "Rendered standalone kubevirt DataVolume yaml manifest:\n# BEGIN\n%s# END",
         yaml.safe_dump(data_volume_manifest, sort_keys=False)
@@ -616,7 +651,8 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
         vm_manifest,
         data_volume_manifest,
         timeout=timeout,
-        interval=interval
+        interval=interval,
+        retain_root_volume=_as_bool(getattr(my_build, 'k8s_retain_root_pv', None), default=False),
     )
     if ip_address is None:
         logging.error(f"VM IP Address is None. Exiting.")
@@ -624,6 +660,182 @@ def kubevirt_instance(my_build, timeout=3600, interval=10):
 
     logging.info(f"VM IP Address: {ip_address}")
     my_build.remoteIp = ip_address
+
+    if my_build.k8s_ssh_transport_resolved == SSH_TRANSPORT_KUBECTL:
+        try:
+            kubevirt_start_port_forward(my_build)
+        except Exception as e:
+            logging.error('failed to start kubectl port-forward to the builder VM: %s', e)
+            sys.exit(1)
+
+
+def kubevirt_preflight_ssh_transport(my_build):
+    """Resolve k8s_ssh_transport and check the CLI it needs, before creating cluster objects."""
+    transport = resolve_ssh_transport(my_build, is_kubevirt=True)
+    my_build.k8s_ssh_transport_resolved = transport
+    if transport == SSH_TRANSPORT_KUBECTL:
+        kubectl = find_binary(getattr(my_build, 'k8s_kubectl_path', None), 'kubectl')
+        if not kubectl:
+            raise ValueError(
+                "k8s_ssh_transport is kubectl but kubectl was not found; "
+                "install kubectl, set k8s_kubectl_path, or choose k8s_ssh_transport: virtctl|direct|proxy")
+        my_build.k8s_kubectl_bin = kubectl
+    elif transport == SSH_TRANSPORT_VIRTCTL:
+        virtctl = find_binary(getattr(my_build, 'k8s_virtctl_path', None), 'virtctl')
+        if not virtctl:
+            if ssh_transport_is_explicit(my_build):
+                raise ValueError("k8s_ssh_transport is virtctl but virtctl was not found; "
+                                 "install virtctl or set k8s_virtctl_path")
+            raise ValueError(
+                "virtctl was not found. KubeVirt builds reach the builder through "
+                "`virtctl port-forward --stdio` by default (needs virtualmachineinstances/portforward). "
+                "Install virtctl or set k8s_virtctl_path, or set k8s_ssh_transport: kubectl "
+                "(kubectl port-forward to the virt-launcher pod, needs only pods/portforward)")
+        my_build.k8s_virtctl_bin = virtctl
+    logging.info('kubevirt build SSH transport: %s', transport)
+    return transport
+
+
+def kubevirt_virtctl_proxy_argv(my_build, remote_port=None):
+    """virtctl port-forward --stdio argv for this build (kubeconfig, context, namespace)."""
+    if remote_port is None:
+        remote_port = getattr(my_build, 'build_host_ssh_port', 22) or 22
+    return virtctl_proxy_command(
+        getattr(my_build, 'k8s_virtctl_bin', None) or 'virtctl', my_build.k8s_namespace, my_build.instancename,
+        remote_port, getattr(my_build, 'k8s_kubeconfig_path', None), getattr(my_build, 'k8s_kubeconfig_context', None))
+
+
+def kubevirt_write_ssh_config(my_build):
+    """With the virtctl transport, write an OpenSSH config for `ssh -F <file> <alias>`.
+
+    Not written for kubectl (its local port is only valid while builderdash
+    runs), direct or proxy. A write error is a warning; the build goes on.
+    """
+    my_build.k8s_ssh_config_file = None
+    if getattr(my_build, 'k8s_ssh_transport_resolved', None) != SSH_TRANSPORT_VIRTCTL:
+        return None
+    path = ssh_config_path(my_build)
+    text = ssh_config_text(
+        ssh_alias(my_build), my_build.sshkeyuser, getattr(my_build, 'sshkey', None),
+        kubevirt_virtctl_proxy_argv(my_build),
+        note=f"builder VM {my_build.k8s_namespace}/{my_build.instancename}")
+    try:
+        write_ssh_config(path, text)
+    except OSError as e:
+        logging.warning('could not write the builder ssh config %s: %s', path, e)
+        return None
+    my_build.k8s_ssh_config_file = path
+    logging.info('builder ssh config: %s  (ssh -F %s %s)', path, shlex.quote(path), ssh_alias(my_build))
+    return path
+
+
+def kubevirt_start_port_forward(my_build):
+    """Supervised `kubectl port-forward pod/<virt-launcher> LOCAL:<build_host_ssh_port>`."""
+    namespace = my_build.k8s_namespace
+    vm_name = my_build.instancename
+    core = my_build.k8s_client_core_v1_api
+    vmi = get_vmi(my_build.k8s_custom_objects_api, namespace, vm_name) or {}
+    vmi_uid = (vmi.get('metadata') or {}).get('uid')
+    pod = wait_for_launcher_pod(core, namespace, vm_name, vmi_uid=vmi_uid)
+    remote_port = int(getattr(my_build, 'build_host_ssh_port', 22) or 22)
+    forward = PortForward(
+        kubectl_base_args(my_build.k8s_kubectl_bin,
+                          getattr(my_build, 'k8s_kubeconfig_path', None),
+                          getattr(my_build, 'k8s_kubeconfig_context', None)),
+        namespace, pod,
+        local_port=int(getattr(my_build, 'k8s_ssh_local_port', 0) or 0),
+        remote_port=remote_port,
+        log_path=getattr(my_build, 'k8s_port_forward_log', None) or 'port-forward.log',
+        pod_resolver=lambda: find_launcher_pod(core, namespace, vm_name, vmi_uid=vmi_uid),
+    )
+    forward.start(wait=int(getattr(my_build, 'k8s_port_forward_timeout', 60) or 60))
+    atexit.register(forward.stop)
+    my_build.k8s_port_forward = forward
+    my_build.k8s_ssh_target = ('127.0.0.1', forward.local_port)
+    logging.info('builder VM %s/%s is reached through kubectl port-forward pod/%s 127.0.0.1:%d -> %d',
+                 namespace, vm_name, pod, forward.local_port, remote_port)
+    return forward
+
+
+def kubevirt_stop_port_forward(my_build):
+    forward = getattr(my_build, 'k8s_port_forward', None)
+    if forward is not None:
+        try:
+            forward.stop()
+        except Exception as e:
+            logging.warning('stopping kubectl port-forward raised: %s', e)
+        my_build.k8s_port_forward = None
+
+
+def kubevirt_kubectl_prefix(my_build):
+    args = ['kubectl']
+    if getattr(my_build, 'k8s_kubeconfig_path', None):
+        args += ['--kubeconfig', os.path.expanduser(str(my_build.k8s_kubeconfig_path))]
+    if getattr(my_build, 'k8s_kubeconfig_context', None):
+        args += ['--context', str(my_build.k8s_kubeconfig_context)]
+    args += ['-n', str(my_build.k8s_namespace)]
+    return ' '.join(shlex.quote(a) for a in args)
+
+
+def kubevirt_virtctl_prefix(my_build):
+    args = [getattr(my_build, 'k8s_virtctl_bin', None) or 'virtctl']
+    if getattr(my_build, 'k8s_kubeconfig_path', None):
+        args += ['--kubeconfig', os.path.expanduser(str(my_build.k8s_kubeconfig_path))]
+    if getattr(my_build, 'k8s_kubeconfig_context', None):
+        args += ['--context', str(my_build.k8s_kubeconfig_context)]
+    args += ['-n', str(my_build.k8s_namespace)]
+    return ' '.join(shlex.quote(a) for a in args)
+
+
+def kubevirt_failed_build_help(my_build, vm_halted):
+    ns = my_build.k8s_namespace
+    name = my_build.instancename
+    kubectl = kubevirt_kubectl_prefix(my_build)
+    virtctl = kubevirt_virtctl_prefix(my_build)
+    ssh_config_file = getattr(my_build, 'k8s_ssh_config_file', None)
+    run_id = getattr(my_build, 'k8s_build_run_id', None)
+    state = 'stopped (runStrategy: Halted)' if vm_halted else 'not running or could not be stopped (check it)'
+    lines = [
+        'KubeVirt build FAILED. Nothing was deleted; cleanup is up to you.',
+        f'  builder VM:          {ns}/{name} ({state})',
+        f'  image DataVolume/PVC: {ns}/{name} (kept)',
+        f'  start it again:      {virtctl} start {shlex.quote(name)}'
+        f"   (or: {kubectl} patch vm {shlex.quote(name)} --type merge -p '{{\"spec\":{{\"runStrategy\":\"Always\"}}}}')",
+    ]
+    if ssh_config_file:
+        lines.append(f'  ssh into it:         ssh -F {shlex.quote(ssh_config_file)} {ssh_alias(my_build)}'
+                     '   (after it is running again)')
+    lines += [
+        f'  reach its sshd:      {kubectl} port-forward pod/<virt-launcher-pod> 2222:22'
+        f'   (pod: {kubectl} get pod -l vm.kubevirt.io/name={name})',
+        f'  stop it again:       {virtctl} stop {shlex.quote(name)}',
+        f'  clean up by hand:    {kubectl} delete vm {shlex.quote(name)} && {kubectl} delete dv {shlex.quote(name)}',
+    ]
+    if run_id:
+        lines.append(f'  objects of this run: {kubectl} get vm,vmi,dv,pvc,pod -l {LABEL_RUN_ID}={run_id}')
+    return '\n'.join(lines)
+
+
+def kubevirt_stop_failed_build(my_build):
+    """On failure: stop the port-forward, halt (not delete) the builder VM, keep VM and DV/PVC, log how to resume."""
+    kubevirt_stop_port_forward(my_build)
+    if getattr(my_build, 'k8s_failure_handled', False):
+        return
+    api = getattr(my_build, 'k8s_custom_objects_api', None)
+    name = getattr(my_build, 'instancename', None)
+    if api is None or not name:
+        return
+    my_build.k8s_failure_handled = True
+    vm_halted = False
+    if getattr(my_build, 'k8s_vm_deleted', False):
+        logging.info('builder VM %s was already deleted; nothing to stop', name)
+    elif get_vm(api, my_build.k8s_namespace, name) is not None:
+        try:
+            stop_vmi(api, my_build.k8s_namespace, name)
+            vm_halted = True
+        except Exception as e:
+            logging.error('failed to stop kubevirt VM %s: %s', name, e)
+    logging.error(kubevirt_failed_build_help(my_build, vm_halted))
 
 
 def dispatchOption(option, args, ssh, myBuild):
@@ -739,10 +951,23 @@ def processSection(configSection, ssh, myBuild):
 
 def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
     logging.info('ssh_connect called')
+    transport = resolve_ssh_transport(myBuild, is_kubevirt=myBuild.env_provider == EnvProvider.K8S_VM)
     target_hostname = resolve_ssh_target_hostname(myBuild)
-    logging.info('ssh target hostname is %s (remoteIp %s)', target_hostname, myBuild.remoteIp)
+    target_port = getattr(myBuild, 'build_host_ssh_port', 22) or 22
+    sock_factory = None
+    if transport == SSH_TRANSPORT_KUBECTL:
+        target_hostname, target_port = myBuild.k8s_ssh_target
+    elif transport == SSH_TRANSPORT_VIRTCTL:
+        proxy_command = ' '.join(shlex.quote(a) for a in kubevirt_virtctl_proxy_argv(myBuild, target_port))
+        logging.info('ssh ProxyCommand: %s', proxy_command)
+        sock_factory = lambda: paramiko.ProxyCommand(proxy_command)
+        target_hostname = myBuild.instancename
+    logging.info('ssh transport %s, target %s:%s (remoteIp %s)', transport, target_hostname, target_port,
+                 myBuild.remoteIp)
+    if hasattr(myBuild, 'proxy_conf') and transport != SSH_TRANSPORT_PROXY:
+        logging.info('proxy_conf is ignored because k8s_ssh_transport is %s', transport)
     # TODO clean up variable names below
-    if hasattr(myBuild, 'proxy_conf'):
+    if transport == SSH_TRANSPORT_PROXY:
         ssh = SSHConnection(target_hostname=target_hostname, target_port=myBuild.build_host_ssh_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
                             target_timeout=timeout, target_attempt_limit=attempt_limit, target_retry_delay=retry_delay,
@@ -757,10 +982,11 @@ def ssh_connect(myBuild, timeout=None, attempt_limit=60, retry_delay=10.0):
                             proxy_missing_host_key_policy=myBuild.proxy_conf['proxy_missing_host_key_policy'],
                             proxy_channel_alt_src_hostname=myBuild.proxy_conf['proxy_channel_alt_src_hostname'])
     else:
-        ssh = SSHConnection(target_hostname=target_hostname, target_port=myBuild.build_host_ssh_port,
+        ssh = SSHConnection(target_hostname=target_hostname, target_port=target_port,
                             target_username=myBuild.sshkeyuser, target_key_filename=myBuild.sshkey,
                             target_timeout=timeout, target_attempt_limit=attempt_limit,
-                            target_missing_host_key_policy=paramiko.AutoAddPolicy())
+                            target_missing_host_key_policy=paramiko.AutoAddPolicy(),
+                            target_sock_factory=sock_factory)
     try:
         ssh.connect()
     except Exception as e:
@@ -849,10 +1075,8 @@ def stopInstance(myBuild):
         compute = googleapiclient.discovery.build('compute', 'v1', cache_discovery=False)
         result = compute.instances().stop(project=myBuild.projectname, zone=myBuild.region, instance=str(myBuild.instancename)).execute()
     elif myBuild.env_provider == EnvProvider.K8S_VM:
-        try:
-            stop_vmi(myBuild.k8s_custom_objects_api, myBuild.k8s_namespace, myBuild.instancename)
-        except Exception as e:
-            logging.error('failed to stop kubevirt vmi: %s', e)
+        # Halt (do not delete) the builder VM; keep it and its DV/PVC for debugging.
+        kubevirt_stop_failed_build(myBuild)
     else:
         logging.error("build has invalid env_provider")
         sys.exit(1)
@@ -1153,7 +1377,9 @@ def deleteInstance(delList, myBuild):
                 deleted = True
     elif myBuild.env_provider == EnvProvider.K8S_VM:
         logging.info(f"Deleting kubevirt instance: {myBuild.instancename}")
+        kubevirt_stop_port_forward(myBuild)
         delete_vm(myBuild.k8s_custom_objects_api, myBuild.k8s_namespace, myBuild.instancename)
+        myBuild.k8s_vm_deleted = True
         logging.info(
             "KubeVirt VM deleted. Standalone DataVolume/PVC '%s/%s' remains as the saved image artifact.",
             myBuild.k8s_namespace,
@@ -1294,6 +1520,7 @@ def runBuild(root, myBuild, ssh, scriptName):
     logging.info("##############################################################################################")
     logging.info("Reached Log Stage")
 
+    kubevirt_failed = False
     try:
         if root:
             ssh = processInitSection(config[0], myBuild)
@@ -1309,9 +1536,23 @@ def runBuild(root, myBuild, ssh, scriptName):
             if hasattr(x, 'newConnect'):
                 connectionObj = x['newConnect']
             '''
+    except SystemExit as e:
+        # KubeVirt: a failed build stops (halts) its builder VM and keeps the VM and DV/PVC.
+        if root and e.code not in (None, 0) and myBuild.env_provider == EnvProvider.K8S_VM:
+            kubevirt_stop_failed_build(myBuild)
+        raise
     except Exception as e:
         logging.exception("Error in initReturnList")
         stopInstance(myBuild)
+        kubevirt_failed = myBuild.env_provider == EnvProvider.K8S_VM
+    finally:
+        if root and myBuild.env_provider == EnvProvider.K8S_VM:
+            kubevirt_stop_port_forward(myBuild)
+
+    if root and kubevirt_failed:
+        if ssh is not None:
+            ssh.disconnect()
+        sys.exit(1)
 
     if root:
         ssh.disconnect()
